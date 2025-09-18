@@ -75,10 +75,16 @@ class MultiPartGCNModel(nn.Module):
         else:
             self.fusion = ConcatMLPFusion(part_dims, out_embed_dim, hidden_dim=max(512, out_embed_dim))
 
-    def forward(self, parts_kpts: Dict[str, np.ndarray | torch.Tensor]) -> torch.Tensor:
+    def forward(self, parts_kpts: Dict[str, np.ndarray | torch.Tensor], pose_len: Optional[torch.Tensor | np.ndarray] = None) -> torch.Tensor:
         device = next(self.parameters()).device
         feats = []
         B_ref: Optional[int] = None
+        # Build optional mask from pose_len
+        mask: Optional[torch.Tensor] = None
+        if pose_len is not None:
+            if isinstance(pose_len, np.ndarray):
+                pose_len = torch.from_numpy(pose_len)
+            pose_len = pose_len.to(device)
         for part in self.parts:
             k = parts_kpts[part]
             x = _np_or_torch_to_nctv(k, drop_conf=self.drop_conf, device=device)
@@ -86,7 +92,12 @@ class MultiPartGCNModel(nn.Module):
                 B_ref = x.size(0)
             else:
                 assert x.size(0) == B_ref, "All parts must share the same batch size"
-            x = self.backbones[part](x)  # [B, Dp]
+            # Create/update mask matching current T
+            if pose_len is not None:
+                T = x.size(2)
+                m = torch.arange(T, device=device).unsqueeze(0).expand(B_ref, -1)
+                mask = (m < pose_len.view(-1, 1)).to(x.dtype)
+            x = self.backbones[part](x, mask=mask)  # [B, Dp]
             feats.append(x)
         z = self.fusion(feats)  # [B, D]
         return z

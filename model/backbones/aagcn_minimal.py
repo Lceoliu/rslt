@@ -128,8 +128,8 @@ class AAGCNBackbone(nn.Module):
             STGCNBlock(128, embed_dim, A, stride=2),
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [N, C, T, V]
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        # x: [N, C, T, V]; mask: [N, T] with 1 for valid frames
         N, C, T, V = x.shape
         x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)  # [N, VC, T]
         x = self.data_bn(x)
@@ -138,10 +138,19 @@ class AAGCNBackbone(nn.Module):
         for blk in self.st_blocks:
             x = blk(x)
 
-        # Global average pool over T and V
-        x = F.avg_pool2d(x, x.shape[-2:])  # [N, embed_dim, 1, 1]
-        x = x.flatten(1)
-        return x
+        # Mask-aware spatiotemporal average pooling
+        if mask is None:
+            x = F.avg_pool2d(x, x.shape[-2:])  # [N, D, 1, 1]
+            return x.flatten(1)
+        else:
+            m = mask.float().unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
+            # Downsample/upsample mask to match temporal dim after strides
+            To = x.size(2)
+            if m.size(2) != To:
+                m = F.interpolate(m, size=(To, 1), mode='nearest')
+            x = (x * m).sum(dim=2) / (m.sum(dim=2).clamp_min(1e-6))  # [N, D, V]
+            x = x.mean(dim=-1)  # [N, D]
+            return x
 
 
 def build_adjacency_from_numpy(A_np) -> torch.Tensor:

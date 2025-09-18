@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
@@ -14,18 +14,29 @@ except Exception:
 from model.config import load_config
 from model.embedding import build_model_from_config
 from training.data import build_dataloaders
-from training.utils import accuracy
 
 
-class Classifier(nn.Module):
-    def __init__(self, embedder: nn.Module, embed_dim: int, nclass: int):
+class EmbedderWrapper(nn.Module):
+    """Wraps the MultiPart embedder to accept both my_dataset dict batches and
+    dummy (parts, label) style batches. Returns embeddings tensor.
+    """
+
+    def __init__(self, embedder: nn.Module):
         super().__init__()
         self.embedder = embedder
-        self.head = nn.Linear(embed_dim, nclass)
 
-    def forward(self, parts):
-        z = self.embedder(parts)
-        return self.head(z)
+    def forward(self, batch_or_parts):
+        # Case 1: dataset/my_dataset batch dict
+        if isinstance(batch_or_parts, dict) and 'pose' in batch_or_parts:
+            parts = batch_or_parts['pose']  # {part: Tensor[B,T,V,C]}
+            pose_len = batch_or_parts.get('pose_len')  # Tensor[B]
+            return self.embedder(parts, pose_len=pose_len)
+        # Case 2: fallback tuple/list from DummyPartsDataset: (parts, label)
+        if isinstance(batch_or_parts, (tuple, list)) and len(batch_or_parts) >= 1:
+            parts = batch_or_parts[0]
+            return self.embedder(parts)
+        # Case 3: directly a parts dict
+        return self.embedder(batch_or_parts)
 
 
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -37,26 +48,34 @@ def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     return a
 
 
+def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
+    """Return a placeholder loss for pipeline verification.
+    - 'none': zero loss but keeps graph: (z * 0).sum()
+    - 'l2': small L2 to exercise backward: 1e-6 * (z ** 2).mean()
+    """
+    if mode == 'l2':
+        return 1e-6 * (z ** 2).mean()
+    return (z * 0.0).sum()
+
+
 def train(args):
-    local_rank = args.local_rank
     cfg = load_config(args.config)
     if args.train_config:
         train_cfg = load_config(args.train_config)
         cfg = _deep_update(cfg, train_cfg)
-    model = build_model_from_config(cfg)
-    embed_dim = int(cfg['model'].get('embed_dim', 512))
-    nclass = int(cfg.get('nclass', 10))
-    net = Classifier(model, embed_dim, nclass)
+
+    # Build embedder and wrap for flexible batch handling
+    embedder = build_model_from_config(cfg)
+    net = EmbedderWrapper(embedder)
 
     ds_config_path = Path(args.deepspeed_config)
     assert ds_config_path.exists(), f"DeepSpeed config not found: {ds_config_path}"
 
     engine, optimizer, _, _ = deepspeed.initialize(
-        args=args, model=net, model_parameters=net.parameters(), config=str(ds_config_path)
+        args=args, model=net, model_parameters=net.parameters()
     )
 
     train_loader, val_loader, _ = build_dataloaders(cfg)
-    loss_fn = nn.CrossEntropyLoss()
 
     epochs = int(cfg.get('train', {}).get('epochs', args.epochs))
     log_interval = int(cfg.get('train', {}).get('log_interval', 10))
@@ -64,42 +83,40 @@ def train(args):
     save_dir = Path(cfg.get('train', {}).get('save_dir', 'runs/ckpts'))
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    dummy_mode = str(cfg.get('train', {}).get('dummy_loss', 'none'))  # 'none' or 'l2'
+
     global_step = 0
     for epoch in range(epochs):
         engine.train()
-        for step, (parts, label) in enumerate(train_loader):
-            logits = engine(parts)
-            labels_t = torch.as_tensor(label, dtype=torch.long, device=engine.device)
-            loss = loss_fn(logits, labels_t)
+        for step, batch in enumerate(train_loader):
+            z = engine(batch)  # embeddings [B, D]
+            loss = _make_dummy_loss(z, mode=dummy_mode)
             engine.backward(loss)
             engine.step()
             global_step += 1
             if global_step % log_interval == 0:
-                top1, = accuracy(logits.detach(), labels_t, topk=(1,))
-                engine.print(f"epoch={epoch} step={global_step} loss={loss.item():.4f} top1={top1.item():.2f}")
+                with torch.no_grad():
+                    mean_norm = z.norm(dim=1).mean().item()
+                engine.print(f"epoch={epoch} step={global_step} loss={loss.item():.6f} |z|={mean_norm:.3f}")
             if global_step % val_interval == 0 and engine.global_rank == 0:
-                eval_top1 = evaluate(engine, val_loader)
-                engine.print(f"[eval] step={global_step} top1={eval_top1:.2f}")
+                eval_stat = evaluate(engine, val_loader)
+                engine.print(f"[eval] step={global_step} mean_|z|={eval_stat:.3f}")
                 engine.save_checkpoint(str(save_dir))
 
     if engine.global_rank == 0:
-        eval_top1 = evaluate(engine, val_loader)
-        engine.print(f"[final eval] top1={eval_top1:.2f}")
+        eval_stat = evaluate(engine, val_loader)
+        engine.print(f"[final eval] mean_|z|={eval_stat:.3f}")
         engine.save_checkpoint(str(save_dir))
 
 
 @torch.no_grad()
 def evaluate(engine, loader: DataLoader) -> float:
     engine.eval()
-    correct = 0
-    total = 0
-    for parts, label in loader:
-        logits = engine(parts)
-        pred = logits.argmax(dim=1)
-        labels_t = torch.as_tensor(label, dtype=torch.long, device=engine.device)
-        total += labels_t.size(0)
-        correct += (pred == labels_t).sum().item()
-    return 100.0 * correct / max(1, total)
+    norms = []
+    for batch in loader:
+        z = engine(batch)
+        norms.append(z.norm(dim=1).mean().item())
+    return float(sum(norms) / max(1, len(norms)))
 
 
 def main():

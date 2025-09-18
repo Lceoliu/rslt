@@ -97,13 +97,22 @@ class STGCNBackbone(nn.Module):
             STGCNBlock(128, embed_dim, A, stride=2),
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         N, C, T, V = x.shape
         x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)
         x = self.data_bn(x)
         x = x.view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
         for blk in self.blocks:
             x = blk(x)
-        x = F.avg_pool2d(x, x.shape[-2:])
-        return x.flatten(1)
+        if mask is None:
+            x = F.avg_pool2d(x, x.shape[-2:])
+            return x.flatten(1)
+        else:
+            m = mask.float().unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
+            To = x.size(2)
+            if m.size(2) != To:
+                m = F.interpolate(m, size=(To, 1), mode='nearest')
+            x = (x * m).sum(dim=2) / (m.sum(dim=2).clamp_min(1e-6))  # [N, D, V]
+            x = x.mean(dim=-1)  # [N, D]
+            return x
 
