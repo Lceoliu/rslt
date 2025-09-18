@@ -150,6 +150,7 @@ class MyDataset(Dataset):
         annotation = self._annotations[data_id]
         sample = {}
         pose = self.get_pose(data_id)  # (T, K, C)
+        T = pose.shape[0]
         augs = self.config.get('augmentations', '')
         prob = self.config.get('aug_prob', 0.5)
         if np.random.rand() < prob and self.split == 'train':
@@ -173,7 +174,7 @@ class MyDataset(Dataset):
         sample['pose'] = pose  # {str: Tensor} or Tensor
         sample['text'] = annotation['text']
         sample['gloss'] = annotation.get('gloss', '').split()
-        sample['frame_cnt'] = pose.shape[0]
+        sample['frame_cnt'] = T
         sample['adjacency_matrix'] = {
             k: torch.from_numpy(v)
             for k, v in self.get_adjacency_matrix(normalize=True).items()
@@ -279,7 +280,7 @@ def create_dataloader(
 
 if __name__ == "__main__":
     config = {
-        "data_dir": "/path/to/your/dataset",
+        "data_dir": "/nas/DDDataLang/250916/csl_dental",
         "augmentations": "speed,mask",
     }
     transform = NormalizeProcessor()
