@@ -1,0 +1,3 @@
+[submodule "pyskl"]
+	path = third_party/pyskl
+	url = https://github.com/kennymckormick/pyskl
