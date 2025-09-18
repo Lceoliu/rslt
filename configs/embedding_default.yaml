@@ -2,6 +2,6 @@ model:
   embed_dim: 512           # final embedding dimension D
   part_embed_dim: 256      # per-part backbone output dim
   backbone: aagcn          # aagcn | stgcn
-  fusion: concat_mlp       # concat_mlp | attention
-  parts: [body, face, left_hand, right_hand]
+  fusion: attention        # concat_mlp | attention
+  parts: [body, face, left_hand, right_hand, fullbody]
   drop_conf: true          # drop confidence during training/inference

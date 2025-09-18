@@ -5,12 +5,15 @@ from typing import Dict, Any
 import numpy as np
 import torch
 
-from model.parts_gcn import MultiPartGCNModel, PARTS_DEFAULT
+from .parts_gcn import MultiPartGCNModel, PARTS_DEFAULT
 
 
 def build_model_from_config(cfg: Dict[str, Any]) -> MultiPartGCNModel:
     mcfg = cfg.get("model", {})
     parts = mcfg.get("parts", PARTS_DEFAULT)
+    # Ensure fullbody is included
+    if 'fullbody' not in parts:
+        parts = list(dict.fromkeys(list(parts) + ['fullbody']))
     backbone = mcfg.get("backbone", "aagcn")
     part_embed_dim = int(mcfg.get("part_embed_dim", 256))
     out_embed_dim = int(mcfg.get("embed_dim", 512))
@@ -32,4 +35,3 @@ def compute_embedding_from_parts(parts: Dict[str, np.ndarray], cfg: Dict[str, An
     model.eval()
     z = model(parts)  # [1, D]
     return z.cpu().numpy()
-

@@ -2,3 +2,6 @@
 **/__pycache__/
 .vscode/
 AGENTS.md
+
+!tests/
+!tests/test_*.py
