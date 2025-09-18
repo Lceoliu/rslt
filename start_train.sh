@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -euo pipefail
+PYTHONPATH=$(pwd)
+echo "PYTHONPATH=${PYTHONPATH}"
+export PYTHONPATH
 
 EMB_CFG=${1:-configs/embedding_default.yaml}
 TRAIN_CFG=${2:-configs/train_default.yaml}

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 from pathlib import Path
 from typing import Dict, Any
@@ -11,7 +9,7 @@ from torch.utils.data import DataLoader
 try:
     import deepspeed  # type: ignore
 except Exception:
-    deepspeed = None
+    raise RuntimeError("DeepSpeed not installed. Install via: pip install deepspeed")
 
 from model.config import load_config
 from model.embedding import build_model_from_config
@@ -40,6 +38,7 @@ def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def train(args):
+    local_rank = args.local_rank
     cfg = load_config(args.config)
     if args.train_config:
         train_cfg = load_config(args.train_config)
@@ -51,9 +50,6 @@ def train(args):
 
     ds_config_path = Path(args.deepspeed_config)
     assert ds_config_path.exists(), f"DeepSpeed config not found: {ds_config_path}"
-
-    if deepspeed is None:
-        raise RuntimeError("DeepSpeed not installed. Install via: pip install deepspeed")
 
     engine, optimizer, _, _ = deepspeed.initialize(
         args=args, model=net, model_parameters=net.parameters(), config=str(ds_config_path)
@@ -113,10 +109,10 @@ def main():
     parser.add_argument('--deepspeed_config', type=str, default='configs/ds_config.json')
     parser.add_argument('--train_config', type=str, default='')
     parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--local_rank', type=int, default=-1, help='for deepspeed')
     args = parser.parse_args()
     train(args)
 
 
 if __name__ == '__main__':
     main()
-

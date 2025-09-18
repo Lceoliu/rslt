@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from ..dataset.transform import NormalizeProcessor
+from dataset.transform import NormalizeProcessor
 from .backbones.aagcn_minimal import AAGCNBackbone, build_adjacency_from_numpy
 from .backbones.stgcn_minimal import STGCNBackbone
 from .fusion import ConcatMLPFusion, AttentionFusion
