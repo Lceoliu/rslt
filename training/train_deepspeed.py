@@ -23,6 +23,8 @@ sys.path.append(Path(__file__).parent.parent.as_posix())
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.distributed import ReduceOp
 try:
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
 except Exception:
@@ -193,11 +195,24 @@ def train(args):
         args=args, model=net, model_parameters=net.parameters()
     )
 
-    # Prepare run directory with timestamp
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = Path(cfg.get('train', {}).get('save_dir_root', 'runs')) / ts
-    ckpt_dir = run_dir / 'checkpoints'
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # Resolve run/ckpt directories (support resume)
+    train_cfg = cfg.get('train', {})
+    resume_from = train_cfg.get('resume_from', '')
+    if resume_from:
+        rf = Path(resume_from)
+        if rf.name == 'checkpoints' and rf.is_dir():
+            ckpt_dir = rf
+            run_dir = rf.parent
+        else:
+            run_dir = rf
+            ckpt_dir = run_dir / 'checkpoints'
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir = Path(train_cfg.get('save_dir_root', 'runs')) / ts
+        ckpt_dir = run_dir / 'checkpoints'
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # TensorBoard writer (rank0 only)
     writer = None
@@ -212,17 +227,39 @@ def train(args):
         except Exception:
             pass
 
-    epochs = int(cfg.get('train', {}).get('epochs', args.epochs))
-    log_interval = int(cfg.get('train', {}).get('log_interval', 10))
-    val_interval = int(cfg.get('train', {}).get('val_interval', 100))
+    epochs = int(train_cfg.get('epochs', args.epochs))
+    log_interval = int(train_cfg.get('log_interval', 10))
+    val_interval = int(train_cfg.get('val_interval', 100))
+    save_every = int(train_cfg.get('save_every', 0))  # 0 disables periodic save
 
+    # Optionally resume engine state
     global_step = 0
-    for epoch in range(epochs):
+    start_epoch = 0
+    if resume_from:
+        try:
+            load_path, client_sd = engine.load_checkpoint(str(ckpt_dir), tag=None)
+            if engine.global_rank == 0:
+                print(f"Resumed from checkpoint: {load_path}")
+            if isinstance(client_sd, dict):
+                global_step = int(client_sd.get('global_step', 0))
+                start_epoch = int(client_sd.get('epoch', 0))
+        except Exception as e:
+            if engine.global_rank == 0:
+                print(f"[WARN] Failed to resume from {ckpt_dir}: {e}")
+            global_step = 0
+            start_epoch = 0
+
+    for epoch in range(start_epoch, epochs):
         engine.train()
         iterable = train_loader
         if engine.global_rank == 0 and tqdm is not None:
             iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
         for step, batch in enumerate(iterable):
+            # move tensors to correct device
+            if isinstance(batch, dict):
+                batch = {k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+            elif isinstance(batch, (tuple, list)):
+                batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
             batch = {
                 k: v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
@@ -247,31 +284,51 @@ def train(args):
                     print(f"epoch={epoch} step={global_step} loss={loss.item():.6f}")
                 else:
                     iterable.set_postfix({"loss": f"{loss.item():.6f}"})
-            if engine.global_rank == 0 and (global_step % val_interval == 0):
+            # Periodic checkpointing on all ranks
+            if save_every > 0 and (global_step % save_every == 0):
+                engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epoch})
+            if global_step % val_interval == 0:
                 eval_stat = evaluate(engine, val_loader)
-                if writer is not None:
-                    writer.add_scalar('val/loss', float(eval_stat), global_step)
-                print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
-                engine.save_checkpoint(str(ckpt_dir))
+                if engine.global_rank == 0:
+                    if writer is not None:
+                        writer.add_scalar('val/loss', float(eval_stat), global_step)
+                    print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
+                # Save checkpoint on all ranks to avoid deadlocks
+                engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epoch})
 
+    eval_stat = evaluate(engine, val_loader)
     if engine.global_rank == 0:
-        eval_stat = evaluate(engine, val_loader)
         if writer is not None:
             writer.add_scalar('val/final_loss', float(eval_stat), global_step)
             writer.flush()
             writer.close()
         print(f"[final eval] val_loss={eval_stat:.6f}")
-        engine.save_checkpoint(str(ckpt_dir))
+    engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epochs})
 
 
 @torch.no_grad()
 def evaluate(engine, loader: DataLoader) -> float:
     engine.eval()
-    losses = []
+    local_sum = 0.0
+    local_count = 0
     for batch in loader:
+        # move tensors to device
+        if isinstance(batch, dict):
+            batch = {k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+        elif isinstance(batch, (tuple, list)):
+            batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
         loss = engine(batch)
-        losses.append(loss.item())
-    return float(sum(losses) / max(1, len(losses)))
+        local_sum += float(loss.item())
+        local_count += 1
+    # Aggregate across ranks to avoid desync
+    if dist.is_initialized():
+        buf = torch.tensor([local_sum, local_count], device=engine.device, dtype=torch.float64)
+        dist.all_reduce(buf, op=ReduceOp.SUM)
+        total_sum = buf[0].item()
+        total_count = max(1.0, buf[1].item())
+        return float(total_sum / total_count)
+    else:
+        return float(local_sum / max(1, local_count))
 
 
 def main():

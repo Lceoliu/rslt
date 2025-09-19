@@ -4,6 +4,9 @@ train:
   log_interval: 10
   val_interval: 100
   save_dir: runs/ckpts
+  save_dir_root: runs
+  save_every: 30           # 0 disables periodic save; otherwise save every N steps
+  resume_from: ''         # set to runs/{timestamp}/checkpoints or runs/{timestamp} to resume
   # dummy_loss: none   # ignored when LLM CE loss is used
 
 dataset:
