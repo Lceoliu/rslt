@@ -14,12 +14,22 @@ if ENABLE_DEBUG:
 
 
 import argparse
+import os
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+try:
+    from torch.utils.tensorboard import SummaryWriter  # type: ignore
+except Exception:
+    SummaryWriter = None  # type: ignore
+try:
+    from tqdm.auto import tqdm  # type: ignore
+except Exception:
+    tqdm = None  # type: ignore
 
 try:
     import deepspeed  # type: ignore
@@ -125,9 +135,7 @@ def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
 
 def train(args):
     cfg = load_config(args.config)
-    # if args.train_config:
-    #     train_cfg = load_config(args.train_config)
-    #     cfg = _deep_update(cfg, train_cfg)
+    # Build dataloaders first (dataset may spawn workers later)
     train_loader, val_loader, _ = build_dataloaders(cfg)
 
     # Build composite trainer module (embedder + adapter + LLM)
@@ -140,33 +148,70 @@ def train(args):
         args=args, model=net, model_parameters=net.parameters()
     )
 
+    # Prepare run directory with timestamp
+    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = Path(cfg.get('train', {}).get('save_dir_root', 'runs')) / ts
+    ckpt_dir = run_dir / 'checkpoints'
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    # TensorBoard writer (rank0 only)
+    writer = None
+    if engine.global_rank == 0 and SummaryWriter is not None:
+        writer = SummaryWriter(log_dir=str(run_dir))
+        # Save a copy of config for reproducibility
+        try:
+            import yaml  # type: ignore
+
+            with open(run_dir / 'config_used.yaml', 'w', encoding='utf-8') as f:
+                yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+        except Exception:
+            pass
+
     epochs = int(cfg.get('train', {}).get('epochs', args.epochs))
     log_interval = int(cfg.get('train', {}).get('log_interval', 10))
     val_interval = int(cfg.get('train', {}).get('val_interval', 100))
-    save_dir = Path(cfg.get('train', {}).get('save_dir', 'runs/ckpts'))
-    save_dir.mkdir(parents=True, exist_ok=True)
-
-    dummy_mode = str(cfg.get('train', {}).get('dummy_loss', 'none'))  # 'none' or 'l2'
 
     global_step = 0
     for epoch in range(epochs):
         engine.train()
-        for step, batch in enumerate(train_loader):
+        iterable = train_loader
+        if engine.global_rank == 0 and tqdm is not None:
+            iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
+        for step, batch in enumerate(iterable):
             loss = engine(batch)  # scalar CE loss from LLM
             engine.backward(loss)
             engine.step()
             global_step += 1
-            if global_step % log_interval == 0 and engine.global_rank == 0:
-                print(f"epoch={epoch} step={global_step} loss={loss.item():.6f}")
-            if global_step % val_interval == 0 and engine.global_rank == 0:
+            if writer is not None:
+                writer.add_scalar('train/loss', float(loss.item()), global_step)
+                # Try to log LR
+                try:
+                    if hasattr(engine, 'optimizer') and engine.optimizer is not None:
+                        pgs = getattr(engine.optimizer, 'param_groups', None)
+                        if pgs:
+                            writer.add_scalar('train/lr', float(pgs[0].get('lr', 0.0)), global_step)
+                except Exception:
+                    pass
+            if engine.global_rank == 0 and (global_step % log_interval == 0):
+                if tqdm is None:
+                    print(f"epoch={epoch} step={global_step} loss={loss.item():.6f}")
+                else:
+                    iterable.set_postfix({"loss": f"{loss.item():.6f}"})
+            if engine.global_rank == 0 and (global_step % val_interval == 0):
                 eval_stat = evaluate(engine, val_loader)
+                if writer is not None:
+                    writer.add_scalar('val/loss', float(eval_stat), global_step)
                 print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
-                engine.save_checkpoint(str(save_dir))
+                engine.save_checkpoint(str(ckpt_dir))
 
     if engine.global_rank == 0:
         eval_stat = evaluate(engine, val_loader)
+        if writer is not None:
+            writer.add_scalar('val/final_loss', float(eval_stat), global_step)
+            writer.flush()
+            writer.close()
         print(f"[final eval] val_loss={eval_stat:.6f}")
-        engine.save_checkpoint(str(save_dir))
+        engine.save_checkpoint(str(ckpt_dir))
 
 
 @torch.no_grad()
