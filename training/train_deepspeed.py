@@ -150,6 +150,24 @@ def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
     return (z * 0.0).sum()
 
 
+def get_cast_type(ds_config: Dict[str, Any]) -> torch.dtype:
+    if 'bf16' in ds_config and ds_config['bf16'].get('enabled', False):
+        return torch.bfloat16
+    if 'fp16' in ds_config and ds_config['fp16'].get('enabled', False):
+        return torch.float16
+    return torch.float32
+
+
+def cast_model(model: nn.Module, dtype: torch.dtype) -> nn.Module:
+    if dtype == torch.bfloat16:
+        model = model.to(torch.bfloat16)
+    elif dtype == torch.float16:
+        model = model.to(torch.float16)
+    else:
+        model = model.to(torch.float32)
+    return model
+
+
 def train(args):
     cfg = load_config(args.config)
     seed = int(cfg.get('train', {}).get('seed', 3407))
@@ -159,11 +177,19 @@ def train(args):
 
     # Build composite trainer module (embedder + adapter + LLM)
     net = VLLMTrainer(cfg)
+    print(f"Model built. Total params: {sum(p.numel() for p in net.parameters()):,}")
 
     ds_config_path = Path(args.deepspeed_config)
     assert ds_config_path.exists(), f"DeepSpeed config not found: {ds_config_path}"
+    with open(ds_config_path, 'r', encoding='utf-8') as f:
+        import json
 
-    engine, optimizer, _, _ = deepspeed.initialize(
+        ds_config = json.load(f)
+
+    net = cast_model(net, get_cast_type(ds_config))
+    print(f"Model cast to {next(net.parameters()).dtype}.")
+
+    engine, optimizer, _, scheduler = deepspeed.initialize(
         args=args, model=net, model_parameters=net.parameters()
     )
 
@@ -197,7 +223,12 @@ def train(args):
         if engine.global_rank == 0 and tqdm is not None:
             iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
         for step, batch in enumerate(iterable):
-            loss = engine(batch)  # scalar CE loss from LLM
+            batch = {
+                k: v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+            with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
+                loss = engine(batch)  # scalar CE loss from LLM
             engine.backward(loss)
             engine.step()
             global_step += 1

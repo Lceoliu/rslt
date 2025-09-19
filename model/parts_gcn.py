@@ -41,6 +41,7 @@ def _np_or_torch_to_nctv(
 
 
 class MultiPartGCNModel(nn.Module):
+
     def __init__(
         self,
         parts: Optional[List[str]] = None,
@@ -48,7 +49,7 @@ class MultiPartGCNModel(nn.Module):
         part_embed_dim: int = 256,
         out_embed_dim: int = 512,
         drop_conf: bool = True,
-        fusion: str = "concat_mlp",  # or "attention"
+        fusion: str = "attention",  # "attention" "concat_mlp"
     ) -> None:
         super().__init__()
         self.parts = parts or PARTS_DEFAULT

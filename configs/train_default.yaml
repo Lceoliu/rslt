@@ -1,13 +1,13 @@
 train:
   seed: 3407
-  epochs: 1
+  epochs: 5
   log_interval: 10
   val_interval: 100
   save_dir: runs/ckpts
   # dummy_loss: none   # ignored when LLM CE loss is used
 
 dataset:
-  data_dir: /workspace/data/data_lc/sslt/csl_dental
+  data_dir: /2023234331/data/csl_dental
   # Optional augmentations used by dataset/my_dataset
   augmentations: "speed"  # "speed", "mask", 
   aug_prob: 0.5
@@ -15,8 +15,16 @@ dataset:
   aug_speed_max: 1.1
   aug_mask_prob: 0.05
 
+model:
+  parts: ["body", "face", "left_hand", "right_hand", "fullbody"]
+  backbone: "aagcn"  # or "stgcn"
+  part_embed_dim: 256
+  out_embed_dim: 512
+  drop_conf: true
+  fusion: "attention"  # "attention" "concat_mlp"
+
 data:
-  batch_size: 8
+  batch_size: 32
   num_workers: 4
   # If dataset.data_dir is not provided, fallback dummy will be used:
   T: 32
@@ -25,7 +33,7 @@ data:
   # custom_builder: your_module:your_builder  # returns (train_loader, val_loader, nclass)
 
 llm:
-  model_name_or_path: /workspace/data/data_lc/sslt/Qwen2.5-0.5B
+  model_name_or_path: /workspace/Qwen
   trust_remote_code: true
   max_text_len: 128
   num_prefix_tokens: 1
@@ -36,8 +44,8 @@ llm:
 
 streaming:
   enabled: true
-  window: 16
-  stride: 8
+  window: 10
+  stride: 5
   drop_last: true
   loss_reduction: mean
 
