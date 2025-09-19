@@ -65,6 +65,7 @@ class VLLMTrainer(nn.Module):
         max_text_len = int(llm_cfg.get('max_text_len', 128))
         gradient_checkpointing = bool(llm_cfg.get('gradient_checkpointing', False))
         freeze_lm = bool(llm_cfg.get('freeze_lm', False))
+        bot_token = llm_cfg.get('bot_token', '<BOT>')
 
         self.llm = LLMWithVisualPrefix(
             model_name_or_path=model_name,
@@ -72,6 +73,7 @@ class VLLMTrainer(nn.Module):
             max_text_len=max_text_len,
             gradient_checkpointing=gradient_checkpointing,
             freeze_lm=freeze_lm,
+            bot_token=bot_token,
         )
         llm_dim = self.llm.hidden_size
 
@@ -84,6 +86,13 @@ class VLLMTrainer(nn.Module):
             num_prefix_tokens=num_prefix_tokens,
             hidden_dim=hidden_dim,
         )
+        # Streaming config (default enabled)
+        s_cfg = cfg.get('streaming', {})
+        self.streaming_enabled = bool(s_cfg.get('enabled', True))
+        self.window = int(s_cfg.get('window', 16))
+        self.stride = int(s_cfg.get('stride', 8))
+        self.drop_last = bool(s_cfg.get('drop_last', True))
+        self.loss_reduction = str(s_cfg.get('loss_reduction', 'mean'))
 
     def forward(self, batch):
         # Accept my_dataset dict or fallback tuple/list
@@ -104,15 +113,21 @@ class VLLMTrainer(nn.Module):
             texts = None
             pose_len = None
         assert isinstance(parts, dict), f"Expected parts dict, got {type(parts)}"
-        z = self.embedder(parts, pose_len=pose_len)  # [B, D]
-        prefix = self.adapter(z)  # [B, P, E]
-
-        if texts is None:
-            # No texts -> return small L2 to exercise backward
-            return 1e-6 * (z ** 2).mean()
-
-        loss = self.llm(prefix, texts)
-        return loss
+        if self.streaming_enabled:
+            # Sliding-window sequence of prefixes
+            z_seq = self.embedder.encode_chunks(
+                parts, pose_len=pose_len, window=self.window, stride=self.stride, drop_last=self.drop_last
+            )  # [B, N, D]
+            prefix_seq = self.adapter(z_seq)  # [B, N, E] (P=1)
+            if texts is None:
+                return 1e-6 * (z_seq ** 2).mean()
+            return self.llm.forward_stream(prefix_seq, texts, reduction=self.loss_reduction)
+        else:
+            z = self.embedder(parts, pose_len=pose_len)  # [B, D]
+            prefix = self.adapter(z)  # [B, P, E]
+            if texts is None:
+                return 1e-6 * (z ** 2).mean()
+            return self.llm(prefix, texts)
 
 
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:

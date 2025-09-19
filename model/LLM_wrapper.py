@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -9,8 +9,10 @@ import torch.nn as nn
 class LLMWithVisualPrefix(nn.Module):
     """HuggingFace CausalLM wrapper that accepts visual prefix embeddings.
 
-    Given prefix embeddings [B, P, E] and texts (list of strings), builds
-    inputs_embeds = concat(prefix, token_embeds(text)) and computes CE loss.
+    Supports two modes:
+    - Non-streaming: prefix [B, P, E] or [B, E] -> concat <BOT> + text -> CE loss.
+    - Streaming: prefix_seq [B, N, E] -> iteratively update KV-cache with prefix and
+      compute CE on (<BOT> + text) per chunk, aggregate losses.
     """
 
     def __init__(
@@ -20,6 +22,7 @@ class LLMWithVisualPrefix(nn.Module):
         max_text_len: int = 128,
         gradient_checkpointing: bool = False,
         freeze_lm: bool = False,
+        bot_token: str = "<BOT>",
     ) -> None:
         super().__init__()
         try:
@@ -36,9 +39,16 @@ class LLMWithVisualPrefix(nn.Module):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+        # Add BOT token
+        self.bot_token = bot_token
+        self.tokenizer.add_special_tokens({"additional_special_tokens": [self.bot_token]})
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path, trust_remote_code=trust_remote_code
         )
+        # Resize embeddings after adding special tokens
+        self.model.resize_token_embeddings(len(self.tokenizer))
+
         if gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
             self.model.gradient_checkpointing_enable()
 
@@ -48,42 +58,114 @@ class LLMWithVisualPrefix(nn.Module):
 
         self.hidden_size = getattr(self.model.config, 'hidden_size', None)
         if self.hidden_size is None:
-            # Some models use 'n_embd' or similar
             self.hidden_size = getattr(self.model.config, 'n_embd', None)
         if self.hidden_size is None:
             raise RuntimeError("Unable to infer LLM hidden size from model config")
 
         self.max_text_len = int(max_text_len)
+        self.prefix_past = None  # type: ignore
+        self.bot_token_id = self.tokenizer.convert_tokens_to_ids(self.bot_token)
 
+    # -------- Non-streaming convenience --------
     def forward(self, prefix_embeds: torch.Tensor, texts: List[str]) -> torch.Tensor:
-        # prefix_embeds: [B, P, E]
+        # Accept [B, E] or [B, P, E]
+        if prefix_embeds.dim() == 2:
+            prefix_embeds = prefix_embeds.unsqueeze(1)
+        return self._loss_once(prefix_embeds, texts)
+
+    def _loss_once(self, prefix_embeds: torch.Tensor, texts: List[str]) -> torch.Tensor:
         device = prefix_embeds.device
+        B, P, E = prefix_embeds.shape
+        # Prepare <BOT> + text
         tok = self.tokenizer(
             texts,
-            return_tensors='pt',
-            padding=True,
-            truncation=True,
-            max_length=self.max_text_len,
-            add_special_tokens=True,
+            return_tensors='pt', padding=True, truncation=True,
+            max_length=self.max_text_len, add_special_tokens=True,
         )
         input_ids = tok['input_ids'].to(device)  # [B, T]
         attn = tok['attention_mask'].to(device)  # [B, T]
 
-        # Token embeddings
+        # BOT embedding
+        bot_ids = torch.full((B, 1), self.bot_token_id, dtype=input_ids.dtype, device=device)
+        bot_emb = self.model.get_input_embeddings()(bot_ids)  # [B,1,E]
+
+        # Text embeddings
         tok_emb = self.model.get_input_embeddings()(input_ids)  # [B, T, E]
-        inputs_embeds = torch.cat([prefix_embeds, tok_emb], dim=1)  # [B, P+T, E]
+        inputs_embeds = torch.cat([prefix_embeds, bot_emb, tok_emb], dim=1)  # [B, P+1+T, E]
 
-        # Attention mask: prefix as 1
-        B, P, _ = prefix_embeds.shape
-        prefix_mask = torch.ones((B, P), dtype=attn.dtype, device=device)
-        attn_full = torch.cat([prefix_mask, attn], dim=1)  # [B, P+T]
+        # Attention mask
+        prefix_mask = torch.ones((B, P + 1), dtype=attn.dtype, device=device)
+        attn_full = torch.cat([prefix_mask, attn], dim=1)
 
-        # Labels: ignore prefix (-100); ignore padding
+        # Labels: ignore prefix and BOT (-100); ignore padding in text
         ignore = torch.full_like(input_ids, fill_value=-100)
-        labels = input_ids.clone()
-        labels = torch.where(attn.bool(), labels, ignore)
-        labels_full = torch.cat([torch.full((B, P), -100, dtype=labels.dtype, device=device), labels], dim=1)
+        labels_text = torch.where(attn.bool(), input_ids, ignore)
+        labels_full = torch.cat([
+            torch.full((B, P + 1), -100, dtype=labels_text.dtype, device=device),
+            labels_text
+        ], dim=1)
 
         out = self.model(inputs_embeds=inputs_embeds, attention_mask=attn_full, labels=labels_full)
         return out.loss
 
+    # -------- Streaming KV-cache API --------
+    def reset_prefix_cache(self) -> None:
+        self.prefix_past = None
+
+    def step_prefix(self, prefix_step: torch.Tensor) -> None:
+        # prefix_step: [B, E] or [B, 1, E]
+        if prefix_step.dim() == 2:
+            prefix_step = prefix_step.unsqueeze(1)
+        B, S, E = prefix_step.shape
+        device = prefix_step.device
+        attn = torch.ones((B, S), dtype=torch.long, device=device)
+        out = self.model(inputs_embeds=prefix_step, attention_mask=attn, use_cache=True, past_key_values=self.prefix_past)
+        self.prefix_past = out.past_key_values
+
+    def loss_with_text(self, texts: List[str]) -> torch.Tensor:
+        # Compute CE given current prefix_past; do not update cache
+        device = next(self.model.parameters()).device
+        tok = self.tokenizer(
+            texts,
+            return_tensors='pt', padding=True, truncation=True,
+            max_length=self.max_text_len, add_special_tokens=True,
+        )
+        input_ids = tok['input_ids'].to(device)  # [B, T]
+        attn = tok['attention_mask'].to(device)  # [B, T]
+
+        # BOT + text embeddings
+        B = input_ids.size(0)
+        bot_ids = torch.full((B, 1), self.bot_token_id, dtype=input_ids.dtype, device=device)
+        bot_emb = self.model.get_input_embeddings()(bot_ids)  # [B,1,E]
+        tok_emb = self.model.get_input_embeddings()(input_ids)  # [B,T,E]
+        inputs_embeds = torch.cat([bot_emb, tok_emb], dim=1)  # [B, 1+T, E]
+
+        # Labels: ignore BOT & padding in text
+        ignore = torch.full_like(input_ids, fill_value=-100)
+        labels_text = torch.where(attn.bool(), input_ids, ignore)
+        labels_full = torch.cat([
+            torch.full((B, 1), -100, dtype=labels_text.dtype, device=device),
+            labels_text
+        ], dim=1)
+
+        out = self.model(
+            inputs_embeds=inputs_embeds,
+            labels=labels_full,
+            use_cache=False,
+            past_key_values=self.prefix_past,
+        )
+        return out.loss
+
+    def forward_stream(self, prefix_seq: torch.Tensor, texts: List[str], reduction: str = 'mean') -> torch.Tensor:
+        # prefix_seq: [B, N, E]
+        assert prefix_seq.dim() == 3, "prefix_seq must be [B, N, E]"
+        self.reset_prefix_cache()
+        B, N, E = prefix_seq.shape
+        losses = []
+        for i in range(N):
+            self.step_prefix(prefix_seq[:, i])
+            loss_i = self.loss_with_text(texts)
+            losses.append(loss_i)
+        if reduction == 'last':
+            return losses[-1]
+        return torch.stack(losses).mean()

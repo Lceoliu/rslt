@@ -101,3 +101,84 @@ class MultiPartGCNModel(nn.Module):
             feats.append(x)
         z = self.fusion(feats)  # [B, D]
         return z
+
+    @torch.no_grad()
+    def _infer_common_T(self, parts_kpts: Dict[str, np.ndarray | torch.Tensor]) -> int:
+        # Guess T from any part
+        for v in parts_kpts.values():
+            if isinstance(v, np.ndarray):
+                return int(v.shape[1] if v.ndim == 4 else v.shape[0])
+            else:
+                return int(v.shape[1] if v.dim() == 4 else v.shape[0])
+        return 0
+
+    def encode_chunks(
+        self,
+        parts_kpts: Dict[str, np.ndarray | torch.Tensor],
+        pose_len: Optional[torch.Tensor | np.ndarray],
+        window: int,
+        stride: int,
+        drop_last: bool = True,
+    ) -> torch.Tensor:
+        """Encode sliding-window chunks to a sequence of embeddings.
+
+        Returns: Tensor[B, N_chunks, D]
+        """
+        device = next(self.parameters()).device
+        # Normalize pose_len
+        if pose_len is not None and isinstance(pose_len, np.ndarray):
+            pose_len = torch.from_numpy(pose_len)
+        if pose_len is not None:
+            pose_len = pose_len.to(device)
+
+        # Determine common number of chunks based on min valid length (ensure at least 1)
+        if pose_len is not None:
+            min_len = int(torch.as_tensor(pose_len).min().item())
+        else:
+            min_len = self._infer_common_T(parts_kpts)
+
+        starts: list[int] = []
+        if drop_last:
+            if min_len >= window:
+                starts = list(range(0, min_len - window + 1, max(1, stride)))
+            else:
+                starts = [0]
+        else:
+            # Allow trailing incomplete; we will mask paddings
+            starts = list(range(0, max(1, min_len), max(1, stride)))
+
+        # Helper to slice time range [s, s+window)
+        def _slice_time(x: np.ndarray | torch.Tensor, s: int, w: int):
+            if isinstance(x, np.ndarray):
+                if x.ndim == 4:  # [B,T,V,C]
+                    return x[:, s : s + w]
+                return x[s : s + w]
+            else:
+                if x.dim() == 4:
+                    return x[:, s : s + w]
+                return x[s : s + w]
+
+        feats_seq = []  # list of [B, D]
+        B_ref: Optional[int] = None
+        for s in starts:
+            # Build per-chunk features then fuse
+            chunk_feats = []
+            chunk_mask: Optional[torch.Tensor] = None
+            for part in self.parts:
+                k_all = parts_kpts[part]
+                k_chunk = _slice_time(k_all, s, window)  # [B,w,V,C] or [w,V,C]
+                x = _np_or_torch_to_nctv(k_chunk, drop_conf=self.drop_conf, device=device)
+                if B_ref is None:
+                    B_ref = x.size(0)
+                # per-chunk mask
+                if pose_len is not None:
+                    t = x.size(2)  # <= window (may be shorter if np slice)
+                    m = torch.arange(t, device=device).unsqueeze(0).expand(B_ref, -1)
+                    chunk_mask = (m + s < pose_len.view(-1, 1)).to(x.dtype)
+                y = self.backbones[part](x, mask=chunk_mask)  # [B, Dp]
+                chunk_feats.append(y)
+            z = self.fusion(chunk_feats)  # [B, D]
+            feats_seq.append(z)
+
+        z_seq = torch.stack(feats_seq, dim=1)  # [B, N_chunks, D]
+        return z_seq

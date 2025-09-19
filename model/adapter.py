@@ -37,9 +37,22 @@ class VisualAdapter(nn.Module):
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z: [B, D]
-        B, D = z.shape
-        y = self.net(z)  # [B, P*E]
-        y = y.view(B, self.num_prefix_tokens, self.llm_dim)
-        return y
+        """Accept [B, D] or [B, N, D] and return prefix embeds.
 
+        - If input is [B, D] -> output [B, P, E]
+        - If input is [B, N, D] -> output [B, N, P, E] (P often = 1). If P==1, returns [B, N, E].
+        """
+        if z.dim() == 2:
+            B, D = z.shape
+            y = self.net(z)  # [B, P*E]
+            y = y.view(B, self.num_prefix_tokens, self.llm_dim)
+            return y
+        elif z.dim() == 3:
+            B, N, D = z.shape
+            z2 = z.reshape(B * N, D)
+            y = self.net(z2).view(B, N, self.num_prefix_tokens, self.llm_dim)
+            if self.num_prefix_tokens == 1:
+                return y.squeeze(2)  # [B, N, E]
+            return y  # [B, N, P, E]
+        else:
+            raise ValueError(f"Unexpected z.dim()={z.dim()} in VisualAdapter.forward")

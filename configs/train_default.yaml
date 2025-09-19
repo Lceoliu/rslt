@@ -31,5 +31,13 @@ llm:
   adapter_hidden: 512
   freeze_lm: false
   gradient_checkpointing: false
+  bot_token: "<BOT>"
+
+streaming:
+  enabled: true
+  window: 16
+  stride: 8
+  drop_last: true
+  loss_reduction: mean
 
 nclass: 10
