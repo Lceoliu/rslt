@@ -5,3 +5,5 @@ AGENTS.md
 
 !tests/
 !tests/test_*.py
+
+runs/

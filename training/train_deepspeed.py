@@ -14,10 +14,11 @@ if ENABLE_DEBUG:
 
 
 import argparse
-import os
+import os, sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple
+sys.path.append(Path(__file__).parent.parent.as_posix())
 
 import torch
 import torch.nn as nn
@@ -41,7 +42,7 @@ from model.embedding import build_model_from_config
 from model.adapter import VisualAdapter
 from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
-from utils.set_seed import set_seed
+from training.utils import set_seed
 
 
 class VLLMTrainer(nn.Module):
@@ -151,7 +152,8 @@ def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
 
 def train(args):
     cfg = load_config(args.config)
-    seed = int(cfg.get('train', {}).get('seed', 42))
+    seed = int(cfg.get('train', {}).get('seed', 3407))
+    set_seed(seed)
     # Build dataloaders first (dataset may spawn workers later)
     train_loader, val_loader, _ = build_dataloaders(cfg)
 

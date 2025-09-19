@@ -1,4 +1,5 @@
 train:
+  seed: 3407
   epochs: 1
   log_interval: 10
   val_interval: 100
