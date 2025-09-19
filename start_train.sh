@@ -2,6 +2,7 @@
 PYTHONPATH=$(pwd)
 echo "PYTHONPATH=${PYTHONPATH}"
 export PYTHONPATH
+export TOKENIZERS_PARALLELISM=false
 
 EMB_CFG=${1:-configs/embedding_default.yaml}
 TRAIN_CFG=${2:-configs/train_default.yaml}
