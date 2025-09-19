@@ -13,30 +13,76 @@ except Exception:
 
 from model.config import load_config
 from model.embedding import build_model_from_config
+from model.adapter import VisualAdapter
+from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
 
 
-class EmbedderWrapper(nn.Module):
-    """Wraps the MultiPart embedder to accept both my_dataset dict batches and
-    dummy (parts, label) style batches. Returns embeddings tensor.
+class VLLMTrainer(nn.Module):
+    """Composite module: MultiPart embedder + adapter + LLM CE loss.
+
+    Forward returns a scalar CE loss computed by the LLM.
     """
 
-    def __init__(self, embedder: nn.Module):
+    def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
-        self.embedder = embedder
+        self.cfg = cfg
+        # Build visual embedder
+        self.embedder = build_model_from_config(cfg)
+        embed_dim = int(cfg.get('model', {}).get('embed_dim', 512))
 
-    def forward(self, batch_or_parts):
-        # Case 1: dataset/my_dataset batch dict
-        if isinstance(batch_or_parts, dict) and 'pose' in batch_or_parts:
-            parts = batch_or_parts['pose']  # {part: Tensor[B,T,V,C]}
-            pose_len = batch_or_parts.get('pose_len')  # Tensor[B]
-            return self.embedder(parts, pose_len=pose_len)
-        # Case 2: fallback tuple/list from DummyPartsDataset: (parts, label)
-        if isinstance(batch_or_parts, (tuple, list)) and len(batch_or_parts) >= 1:
-            parts = batch_or_parts[0]
-            return self.embedder(parts)
-        # Case 3: directly a parts dict
-        return self.embedder(batch_or_parts)
+        # Build LLM
+        llm_cfg = cfg.get('llm', {})
+        model_name = llm_cfg.get('model_name_or_path', 'Qwen/Qwen2.5-0.5B')
+        trust_remote_code = bool(llm_cfg.get('trust_remote_code', True))
+        max_text_len = int(llm_cfg.get('max_text_len', 128))
+        gradient_checkpointing = bool(llm_cfg.get('gradient_checkpointing', False))
+        freeze_lm = bool(llm_cfg.get('freeze_lm', False))
+
+        self.llm = LLMWithVisualPrefix(
+            model_name_or_path=model_name,
+            trust_remote_code=trust_remote_code,
+            max_text_len=max_text_len,
+            gradient_checkpointing=gradient_checkpointing,
+            freeze_lm=freeze_lm,
+        )
+        llm_dim = self.llm.hidden_size
+
+        # Build adapter to project visual embedding to LLM hidden size
+        num_prefix_tokens = int(llm_cfg.get('num_prefix_tokens', 1))
+        hidden_dim = int(llm_cfg.get('adapter_hidden', max(512, embed_dim)))
+        self.adapter = VisualAdapter(
+            in_dim=embed_dim,
+            llm_dim=llm_dim,
+            num_prefix_tokens=num_prefix_tokens,
+            hidden_dim=hidden_dim,
+        )
+
+    def forward(self, batch):
+        # Accept my_dataset dict or fallback tuple/list
+        if isinstance(batch, (tuple, list)) and len(batch) >= 1 and not isinstance(batch[0], (dict,)):
+            # Fallback dummy case: (parts, label)
+            parts = batch[0]
+            texts = None
+            pose_len = None
+        elif isinstance(batch, dict):
+            parts = batch['pose']
+            texts = batch.get('text', None)
+            pose_len = batch.get('pose_len', None)
+        else:
+            parts = batch
+            texts = None
+            pose_len = None
+
+        z = self.embedder(parts, pose_len=pose_len)  # [B, D]
+        prefix = self.adapter(z)  # [B, P, E]
+
+        if texts is None:
+            # No texts -> return small L2 to exercise backward
+            return 1e-6 * (z ** 2).mean()
+
+        loss = self.llm(prefix, texts)
+        return loss
 
 
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -64,9 +110,8 @@ def train(args):
         train_cfg = load_config(args.train_config)
         cfg = _deep_update(cfg, train_cfg)
 
-    # Build embedder and wrap for flexible batch handling
-    embedder = build_model_from_config(cfg)
-    net = EmbedderWrapper(embedder)
+    # Build composite trainer module (embedder + adapter + LLM)
+    net = VLLMTrainer(cfg)
 
     ds_config_path = Path(args.deepspeed_config)
     assert ds_config_path.exists(), f"DeepSpeed config not found: {ds_config_path}"
@@ -89,34 +134,31 @@ def train(args):
     for epoch in range(epochs):
         engine.train()
         for step, batch in enumerate(train_loader):
-            z = engine(batch)  # embeddings [B, D]
-            loss = _make_dummy_loss(z, mode=dummy_mode)
+            loss = engine(batch)  # scalar CE loss from LLM
             engine.backward(loss)
             engine.step()
             global_step += 1
-            if global_step % log_interval == 0:
-                with torch.no_grad():
-                    mean_norm = z.norm(dim=1).mean().item()
-                engine.print(f"epoch={epoch} step={global_step} loss={loss.item():.6f} |z|={mean_norm:.3f}")
+            if global_step % log_interval == 0 and engine.global_rank == 0:
+                print(f"epoch={epoch} step={global_step} loss={loss.item():.6f}")
             if global_step % val_interval == 0 and engine.global_rank == 0:
                 eval_stat = evaluate(engine, val_loader)
-                engine.print(f"[eval] step={global_step} mean_|z|={eval_stat:.3f}")
+                print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
                 engine.save_checkpoint(str(save_dir))
 
     if engine.global_rank == 0:
         eval_stat = evaluate(engine, val_loader)
-        engine.print(f"[final eval] mean_|z|={eval_stat:.3f}")
+        print(f"[final eval] val_loss={eval_stat:.6f}")
         engine.save_checkpoint(str(save_dir))
 
 
 @torch.no_grad()
 def evaluate(engine, loader: DataLoader) -> float:
     engine.eval()
-    norms = []
+    losses = []
     for batch in loader:
-        z = engine(batch)
-        norms.append(z.norm(dim=1).mean().item())
-    return float(sum(norms) / max(1, len(norms)))
+        loss = engine(batch)
+        losses.append(loss.item())
+    return float(sum(losses) / max(1, len(losses)))
 
 
 def main():
