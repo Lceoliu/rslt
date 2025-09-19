@@ -171,15 +171,14 @@ class NormalizeProcessor:
         Returns:
             Dict[str, np.ndarray]: Keypoints with specified keypoints discarded.
         """
-        if not self.discarded_keypoints:
-            return splited_kpts
-        discarded_set = set(self.discarded_keypoints)
+        # Always align kept joints with self.all_indices (global kept set)
+        # This ensures 'fullbody' excludes gaps (e.g., indices 17..22) and any discarded joints.
+        global_kept = set(self.all_indices)
         processed_kpts = {}
         for part, kpts in splited_kpts.items():
+            start_abs = self.body_part_start_idx[part]
             indices = [
-                i
-                for i in range(kpts.shape[1])
-                if (self.body_part_start_idx[part] + i) not in discarded_set
+                i for i in range(kpts.shape[1]) if (start_abs + i) in global_kept
             ]
             processed_kpts[part] = kpts[:, indices, :]
         return processed_kpts
