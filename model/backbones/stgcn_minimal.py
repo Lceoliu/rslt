@@ -38,10 +38,11 @@ class GraphConv(nn.Module):
         self.bn = nn.BatchNorm2d(out_channels)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        A = self.A.to(x.dtype)
         y = 0
         for k in range(self.K):
             z = self.conv[k](x)
-            y = y + torch.einsum("nctv,vw->nctw", z, self.A[k])
+            y = y + torch.einsum("nctv,vw->nctw", z, A[k])
         y = self.bn(y)
         return y
 
@@ -100,6 +101,7 @@ class STGCNBackbone(nn.Module):
     def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         N, C, T, V = x.shape
         x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)
+        x = x.to(self.data_bn.weight.dtype)
         x = self.data_bn(x)
         x = x.view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
         for blk in self.blocks:
@@ -108,7 +110,7 @@ class STGCNBackbone(nn.Module):
             x = F.avg_pool2d(x, x.shape[-2:])
             return x.flatten(1)
         else:
-            m = mask.float().unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
+            m = mask.to(x.dtype).unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
             To = x.size(2)
             if m.size(2) != To:
                 m = F.interpolate(m, size=(To, 1), mode='nearest')

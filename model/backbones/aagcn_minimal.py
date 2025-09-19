@@ -148,7 +148,7 @@ class AAGCNBackbone(nn.Module):
             x = F.avg_pool2d(x, x.shape[-2:])  # [N, D, 1, 1]
             return x.flatten(1)
         else:
-            m = mask.float().unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
+            m = mask.to(x.dtype).unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
             # Downsample/upsample mask to match temporal dim after strides
             To = x.size(2)
             if m.size(2) != To:

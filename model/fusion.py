@@ -16,11 +16,11 @@ class ConcatMLPFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, out_dim),
         )
-        self.net_dtype = self.net[0].weight.dtype  # type: ignore
 
     def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
         x = torch.cat(xs, dim=-1)
-        x.to(self.net_dtype)
+        net_dtype = self.net[0].weight.dtype  # query live dtype (bf16/fp32)
+        x = x.to(net_dtype)
         return self.net(x)
 
 
@@ -34,11 +34,11 @@ class AttentionFusion(nn.Module):
             nn.LayerNorm(d_model),
             nn.Linear(d_model, out_dim),
         )
-        self.net_dtype = self.projs[0].weight.dtype  # type: ignore
 
     def forward(self, xs: List[torch.Tensor]) -> torch.Tensor:
         # xs: list of [N, D_i]
-        xs = [x.to(self.net_dtype) for x in xs]
+        net_dtype = self.projs[0].weight.dtype  # query live dtype
+        xs = [x.to(net_dtype) for x in xs]
         feats = [proj(x) for proj, x in zip(self.projs, xs)]  # [N, d_model] each
         x = torch.stack(feats, dim=1)  # [N, P, d_model]
         x = x + self.pos  # simple positional enc for parts

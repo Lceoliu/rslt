@@ -76,6 +76,8 @@ class LLMWithVisualPrefix(nn.Module):
     def _loss_once(self, prefix_embeds: torch.Tensor, texts: List[str]) -> torch.Tensor:
         device = prefix_embeds.device
         B, P, E = prefix_embeds.shape
+        model_dtype = self.model.get_input_embeddings().weight.dtype
+        prefix_embeds = prefix_embeds.to(model_dtype)
         # Prepare <BOT> + text
         tok = self.tokenizer(
             texts,
@@ -88,9 +90,10 @@ class LLMWithVisualPrefix(nn.Module):
         # BOT embedding
         bot_ids = torch.full((B, 1), self.bot_token_id, dtype=input_ids.dtype, device=device)
         bot_emb = self.model.get_input_embeddings()(bot_ids)  # [B,1,E]
-
+        bot_emb = bot_emb.to(model_dtype)
         # Text embeddings
         tok_emb = self.model.get_input_embeddings()(input_ids)  # [B, T, E]
+        tok_emb = tok_emb.to(model_dtype)
         inputs_embeds = torch.cat([prefix_embeds, bot_emb, tok_emb], dim=1)  # [B, P+1+T, E]
 
         # Attention mask
@@ -116,6 +119,8 @@ class LLMWithVisualPrefix(nn.Module):
         # prefix_step: [B, E] or [B, 1, E]
         if prefix_step.dim() == 2:
             prefix_step = prefix_step.unsqueeze(1)
+        model_dtype = self.model.get_input_embeddings().weight.dtype
+        prefix_step = prefix_step.to(model_dtype)
         B, S, E = prefix_step.shape
         device = prefix_step.device
         attn = torch.ones((B, S), dtype=torch.long, device=device)
