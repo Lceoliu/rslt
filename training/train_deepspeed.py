@@ -1,3 +1,18 @@
+import os
+
+ENABLE_DEBUG = False  # Enable to get more debug info
+if ENABLE_DEBUG:
+    import debugpy
+
+    if os.environ.get('RANK') == '0' or os.environ.get('LOCAL_RANK') == '0':
+        debugpy.listen(('0.0.0.0', 5678))
+        print(
+            f"Process with RANK {os.environ.get('RANK', 'N/A')} is listening on port 5678. Waiting for debugger attach..."
+        )
+        debugpy.wait_for_client()
+        print("Debugger attached to RANK 0.")
+
+
 import argparse
 from pathlib import Path
 from typing import Dict, Any, Tuple
@@ -33,7 +48,8 @@ class VLLMTrainer(nn.Module):
 
         # Build LLM
         llm_cfg = cfg.get('llm', {})
-        model_name = llm_cfg.get('model_name_or_path', 'Qwen/Qwen2.5-0.5B')
+        model_name = llm_cfg.get('model_name_or_path', '../Qwen2.5-0.5B')
+        print(f"Building LLM: {model_name}")
         trust_remote_code = bool(llm_cfg.get('trust_remote_code', True))
         max_text_len = int(llm_cfg.get('max_text_len', 128))
         gradient_checkpointing = bool(llm_cfg.get('gradient_checkpointing', False))
@@ -65,6 +81,9 @@ class VLLMTrainer(nn.Module):
             parts = batch[0]
             texts = None
             pose_len = None
+            print(
+                "Warning: using fallback batch format (parts, label). No text loss will be computed."
+            )
         elif isinstance(batch, dict):
             parts = batch['pose']
             texts = batch.get('text', None)
@@ -73,7 +92,7 @@ class VLLMTrainer(nn.Module):
             parts = batch
             texts = None
             pose_len = None
-
+        assert isinstance(parts, dict), f"Expected parts dict, got {type(parts)}"
         z = self.embedder(parts, pose_len=pose_len)  # [B, D]
         prefix = self.adapter(z)  # [B, P, E]
 
@@ -106,9 +125,10 @@ def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
 
 def train(args):
     cfg = load_config(args.config)
-    if args.train_config:
-        train_cfg = load_config(args.train_config)
-        cfg = _deep_update(cfg, train_cfg)
+    # if args.train_config:
+    #     train_cfg = load_config(args.train_config)
+    #     cfg = _deep_update(cfg, train_cfg)
+    train_loader, val_loader, _ = build_dataloaders(cfg)
 
     # Build composite trainer module (embedder + adapter + LLM)
     net = VLLMTrainer(cfg)
@@ -119,8 +139,6 @@ def train(args):
     engine, optimizer, _, _ = deepspeed.initialize(
         args=args, model=net, model_parameters=net.parameters()
     )
-
-    train_loader, val_loader, _ = build_dataloaders(cfg)
 
     epochs = int(cfg.get('train', {}).get('epochs', args.epochs))
     log_interval = int(cfg.get('train', {}).get('log_interval', 10))
@@ -163,7 +181,7 @@ def evaluate(engine, loader: DataLoader) -> float:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/embedding_default.yaml')
+    parser.add_argument('--config', type=str, default='configs/train_default.yaml')
     parser.add_argument('--deepspeed', action='store_true')
     parser.add_argument('--deepspeed_config', type=str, default='configs/ds_config.json')
     parser.add_argument('--train_config', type=str, default='')

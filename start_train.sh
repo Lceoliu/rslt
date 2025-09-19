@@ -14,8 +14,7 @@ if ! command -v deepspeed >/dev/null 2>&1; then
 fi
 
 deepspeed --num_gpus=${NGPU} training/train_deepspeed.py \
-  --config ${EMB_CFG} \
-  --train_config ${TRAIN_CFG} \
+  --config ${TRAIN_CFG} \
   --deepspeed \
   --deepspeed_config ${DS_CFG}
 

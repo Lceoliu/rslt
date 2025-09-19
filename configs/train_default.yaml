@@ -24,7 +24,7 @@ data:
   # custom_builder: your_module:your_builder  # returns (train_loader, val_loader, nclass)
 
 llm:
-  model_name_or_path: Qwen/Qwen2.5-0.5B
+  model_name_or_path: /workspace/data/data_lc/sslt/Qwen2.5-0.5B
   trust_remote_code: true
   max_text_len: 128
   num_prefix_tokens: 1

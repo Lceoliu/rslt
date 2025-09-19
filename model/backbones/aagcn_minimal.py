@@ -119,7 +119,8 @@ class AAGCNBackbone(nn.Module):
             A = A.unsqueeze(0)
         self.A = A
 
-        self.data_bn = nn.BatchNorm1d(in_channels * A.shape[-1])
+        self.normalize_dim = in_channels * A.shape[-1]
+        self.data_bn = nn.BatchNorm1d(self.normalize_dim)
 
         self.st_blocks = nn.ModuleList([
             STGCNBlock(in_channels, 64, A, stride=1),
@@ -132,6 +133,10 @@ class AAGCNBackbone(nn.Module):
         # x: [N, C, T, V]; mask: [N, T] with 1 for valid frames
         N, C, T, V = x.shape
         x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)  # [N, VC, T]
+        x = x.to(self.data_bn.weight.dtype)  # ensure same dtype
+        assert (
+            x.shape[1] == self.normalize_dim
+        ), f"Expected {self.normalize_dim} channels, got {x.shape[1]}"
         x = self.data_bn(x)
         x = x.view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
 
@@ -162,4 +167,3 @@ def build_adjacency_from_numpy(A_np) -> torch.Tensor:
             A_np = A_np.get("fullbody")
         A_np = A_np.astype("float32")
     return torch.from_numpy(A_np)
-
