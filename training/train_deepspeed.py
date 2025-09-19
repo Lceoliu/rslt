@@ -41,6 +41,7 @@ from model.embedding import build_model_from_config
 from model.adapter import VisualAdapter
 from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
+from utils.set_seed import set_seed
 
 
 class VLLMTrainer(nn.Module):
@@ -135,6 +136,7 @@ def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
 
 def train(args):
     cfg = load_config(args.config)
+    seed = int(cfg.get('train', {}).get('seed', 42))
     # Build dataloaders first (dataset may spawn workers later)
     train_loader, val_loader, _ = build_dataloaders(cfg)
 

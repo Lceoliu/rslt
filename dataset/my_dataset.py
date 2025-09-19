@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import json
 import time
+import os
 
 from .transform import NormalizeProcessor
 from torch.utils.data import Dataset, DataLoader
@@ -12,6 +13,8 @@ from typing import Optional, Dict, Literal, List, Tuple
 from scipy.interpolate import interp1d
 from functools import lru_cache
 
+from functools import lru_cache
+import torch.distributed as dist
 
 class MyDataset(Dataset):
     def __init__(
@@ -29,6 +32,8 @@ class MyDataset(Dataset):
         self.data_ids = []
         self._memmap_data_type = np.float32
         self._load_data()
+
+        self._split_dataset()
 
     def _load_data(self):
         self._data_dir = Path(self.config['data_dir'])
@@ -73,6 +78,76 @@ class MyDataset(Dataset):
         print(
             f"Loaded {len(self.data_ids)} samples from {self._data_dir}, memmap shape: {self._memmap_data.shape}, dtype: {self._memmap_data_type}"
         )
+
+    def _split_dataset(self):
+        self._data_dir = Path(self.config['data_dir'])
+        split_file = self._data_dir / 'split.json'
+        lock_file = split_file.with_suffix('.lock')
+
+        def _atomic_write_json(path: Path, data: dict):
+            tmp = path.with_suffix(path.suffix + '.tmp')
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)  # 原子替换
+
+        # 已存在则直接读
+        if split_file.exists():
+            with open(split_file, 'r', encoding='utf-8') as f:
+                split_data = json.load(f)
+            self.data_ids = split_data.get(self.split, [])
+            print(f"Dataset split '{self.split}': {len(self.data_ids)} samples.")
+            return
+
+        # 并发安全的创建：用 O_EXCL 获取简单文件锁，其他进程轮询等待
+        got_lock = False
+        lock_fd = None
+        try:
+            try:
+                lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                got_lock = True
+            except FileExistsError:
+                got_lock = False
+
+            if got_lock:
+                all_ids = list(self._annotations.keys())
+                train_ids = all_ids[: int(len(all_ids) * 0.8)]
+                val_ids = all_ids[int(len(all_ids) * 0.8) : int(len(all_ids) * 0.9)]
+                test_ids = all_ids[int(len(all_ids) * 0.9) :]
+                split_data = {"train": train_ids, "val": val_ids, "test": test_ids}
+                _atomic_write_json(split_file, split_data)
+            else:
+                # 等待写入完成（最多 ~300s）
+                for _ in range(6000):
+                    if split_file.exists():
+                        break
+                    time.sleep(0.05)
+                if not split_file.exists():
+                    raise TimeoutError(
+                        f"Timed out waiting for {split_file} to be created."
+                    )
+        finally:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except Exception:
+                    pass
+            if got_lock:
+                try:
+                    os.remove(lock_file)
+                except Exception:
+                    pass
+
+        # 若此时已经初始化分布式，可再同步一下（可选）
+        try:
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+        except Exception:
+            pass
+
+        with open(split_file, 'r', encoding='utf-8') as f:
+            split_data = json.load(f)
+        self.data_ids = split_data.get(self.split, [])
+        print(f"Dataset split '{self.split}': {len(self.data_ids)} samples.")
 
     def speed_augment(self, data: np.ndarray, speed_factor: float) -> np.ndarray:
         '''
