@@ -14,7 +14,7 @@ if ENABLE_DEBUG:
 
 
 import argparse
-import os, sys
+import os, sys, random, logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple
@@ -195,7 +195,7 @@ def train(args):
         args=args, model=net, model_parameters=net.parameters()
     )
 
-    # Resolve run/ckpt directories (support resume)
+    # Resolve run/ckpt directories (support resume) with consistent RUN_ID across ranks
     train_cfg = cfg.get('train', {})
     resume_from = train_cfg.get('resume_from', '')
     if resume_from:
@@ -206,13 +206,28 @@ def train(args):
         else:
             run_dir = rf
             ckpt_dir = run_dir / 'checkpoints'
-        run_dir.mkdir(parents=True, exist_ok=True)
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if engine.global_rank == 0:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
     else:
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        run_dir = Path(train_cfg.get('save_dir_root', 'runs')) / ts
+        base_root = Path(train_cfg.get('save_dir_root', 'runs'))
+        run_id = os.environ.get('RUN_ID')
+        if not run_id:
+            # Rank0 creates a run id; broadcast to all
+            run_id = datetime.now().strftime('%Y%m%d_%H%M%S') if (not dist.is_initialized() or dist.get_rank() == 0) else None
+            obj = [run_id]
+            if dist.is_initialized():
+                dist.broadcast_object_list(obj, src=0)
+            run_id = obj[0]  # type: ignore
+        run_dir = base_root / str(run_id)
         ckpt_dir = run_dir / 'checkpoints'
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if engine.global_rank == 0:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
+        if dist.is_initialized():
+            dist.barrier()
 
     # TensorBoard writer (rank0 only)
     writer = None
@@ -226,6 +241,9 @@ def train(args):
                 yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
         except Exception:
             pass
+        # Setup simple file logger for val samples
+        log_path = run_dir / 'val_samples.log'
+        logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler(log_path, encoding='utf-8')])
 
     epochs = int(train_cfg.get('epochs', args.epochs))
     log_interval = int(train_cfg.get('log_interval', 10))
@@ -260,10 +278,6 @@ def train(args):
                 batch = {k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
             elif isinstance(batch, (tuple, list)):
                 batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
-            batch = {
-                k: v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
-            }
             with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
                 loss = engine(batch)  # scalar CE loss from LLM
             engine.backward(loss)
@@ -293,6 +307,11 @@ def train(args):
                     if writer is not None:
                         writer.add_scalar('val/loss', float(eval_stat), global_step)
                     print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
+                    # Sample a few predictions for inspection
+                    try:
+                        sample_and_log_predictions(engine, val_loader, cfg, global_step)
+                    except Exception as e:
+                        print(f"[warn] sample_and_log_predictions failed: {e}")
                 # Save checkpoint on all ranks to avoid deadlocks
                 engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epoch})
 
@@ -329,6 +348,74 @@ def evaluate(engine, loader: DataLoader) -> float:
         return float(total_sum / total_count)
     else:
         return float(local_sum / max(1, local_count))
+
+
+@torch.no_grad()
+def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], global_step: int) -> None:
+    """Randomly sample 3~5 items from val loader, run streaming inference and log results.
+    Rank0 only. Keeps the engine/module state intact.
+    """
+    if dist.is_initialized() and dist.get_rank() != 0:
+        return
+    module = engine.module  # VLLMTrainer
+    assert hasattr(module, 'embedder') and hasattr(module, 'adapter') and hasattr(module, 'llm')
+    window = getattr(module, 'window', 16)
+    stride = getattr(module, 'stride', 8)
+    drop_last = getattr(module, 'drop_last', True)
+    nsamples = random.randint(3, 5)
+    collected = 0
+    # Randomly choose starting batch index to avoid always sampling from the beginning
+    start_offset = random.randint(0, 3)
+    for bidx, batch in enumerate(loader):
+        if bidx < start_offset:
+            continue
+        # Extract candidate indices within this batch
+        B = batch['pose_len'].shape[0] if isinstance(batch, dict) and 'pose_len' in batch else None
+        if not B:
+            continue
+        # Move tensors to device
+        device = engine.device
+        parts = {}
+        for k, v in batch['pose'].items():
+            parts[k] = v.to(device)
+        pose_len = batch.get('pose_len', None)
+        if pose_len is not None:
+            pose_len = pose_len.to(device)
+        texts = batch.get('text', None)
+        # Sample one or two indices from this batch
+        take = min(nsamples - collected, min(2, B))
+        indices = random.sample(range(B), k=take)
+        for i in indices:
+            # Single-item dict
+            single_parts = {k: v[i:i+1] for k, v in parts.items()}
+            single_len = pose_len[i:i+1] if pose_len is not None else None
+            single_text = [texts[i]] if texts is not None else [""]
+            # Streaming encode
+            z_seq = module.embedder.encode_chunks(single_parts, single_len, window, stride, drop_last)  # [1, N, D]
+            prefix_seq = module.adapter(z_seq)  # [1, N, E]
+            # Decode at a few chunk milestones
+            N = prefix_seq.shape[1]
+            step = max(1, N // 5)
+            chunk_points = list(range(0, N, step))
+            if (N - 1) not in chunk_points:
+                chunk_points.append(N - 1)
+            # Log header
+            logging.info(f"step {global_step} val, batch_index={bidx}, sample batch id {i}, gt: \"{single_text[0]}\", total chunks: {N}")
+            # Iterate and generate
+            module.llm.reset_prefix_cache()
+            for ci in range(N):
+                module.llm.step_prefix(prefix_seq[:, ci])
+                if ci in chunk_points:
+                    try:
+                        pred = module.llm.generate_from_prefix(max_new_tokens=48, do_sample=False)
+                        logging.info(f"  chunk {ci} predict: \"{pred[0]}\"")
+                    except Exception as e:
+                        logging.info(f"  chunk {ci} predict: <generation failed: {e}>")
+            collected += 1
+            if collected >= nsamples:
+                break
+        if collected >= nsamples:
+            break
 
 
 def main():

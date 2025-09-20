@@ -174,3 +174,34 @@ class LLMWithVisualPrefix(nn.Module):
         if reduction == 'last':
             return losses[-1]
         return torch.stack(losses).mean()
+
+    @torch.no_grad()
+    def generate_from_prefix(
+        self,
+        max_new_tokens: int = 32,
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int = 0,
+    ) -> List[str]:
+        """Generate text starting from current prefix_past using <BOT> as the first input.
+
+        Returns: list of strings length B.
+        """
+        device = next(self.model.parameters()).device
+        B = len(self.prefix_past[0][0]) if (self.prefix_past is not None) else 1  # fallback
+        bot_ids = torch.full((B, 1), self.bot_token_id, dtype=torch.long, device=device)
+        gen = self.model.generate(
+            input_ids=bot_ids,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k if top_k > 0 else None,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            use_cache=True,
+            past_key_values=self.prefix_past,
+        )
+        # gen includes the BOT token at position 0; strip it
+        gen_no_bot = gen[:, 1:]
+        texts = self.tokenizer.batch_decode(gen_no_bot, skip_special_tokens=True)
+        return texts
