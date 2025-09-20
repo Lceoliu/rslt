@@ -47,8 +47,8 @@ llm:
 
 streaming:
   enabled: true
-  window: 10
-  stride: 5
+  window: 20
+  stride: 10
   drop_last: true
   loss_reduction: mean
 

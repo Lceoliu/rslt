@@ -223,7 +223,7 @@ def train(args):
     print(f"Model cast to {next(net.parameters()).dtype}.")
 
     engine, optimizer, _, scheduler = deepspeed.initialize(
-        args=args, model=net, model_parameters=net.parameters(), config_params=ds_config
+        args=args, model=net, model_parameters=net.parameters()
     )
 
     # Resolve run/ckpt directories (support resume) with consistent RUN_ID across ranks

@@ -25,11 +25,6 @@
       "total_num_steps": 20000
     }
   },
-  "activation_checkpointing": {
-    "partition_activations": true,
-    "contiguous_memory_optimization": true,
-    "cpu_checkpointing": false
-  },
   "wall_clock_breakdown": true
 }
 
