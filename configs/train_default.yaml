@@ -27,7 +27,7 @@ model:
   fusion: "attention"  # "attention" "concat_mlp"
 
 data:
-  batch_size: 32
+  batch_size: 16
   num_workers: 4
   # If dataset.data_dir is not provided, fallback dummy will be used:
   T: 32
