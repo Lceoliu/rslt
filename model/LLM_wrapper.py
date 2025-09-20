@@ -82,7 +82,7 @@ class LLMWithVisualPrefix(nn.Module):
         tok = self.tokenizer(
             texts,
             return_tensors='pt', padding=True, truncation=True,
-            max_length=self.max_text_len, add_special_tokens=True,
+            max_length=self.max_text_len, add_special_tokens=False,
         )
         input_ids = tok['input_ids'].to(device)  # [B, T]
         attn = tok['attention_mask'].to(device)  # [B, T]
@@ -133,7 +133,7 @@ class LLMWithVisualPrefix(nn.Module):
         tok = self.tokenizer(
             texts,
             return_tensors='pt', padding=True, truncation=True,
-            max_length=self.max_text_len, add_special_tokens=True,
+            max_length=self.max_text_len, add_special_tokens=False,
         )
         input_ids = tok['input_ids'].to(device)  # [B, T]
         attn = tok['attention_mask'].to(device)  # [B, T]
