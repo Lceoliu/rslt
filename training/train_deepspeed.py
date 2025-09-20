@@ -174,25 +174,56 @@ def train(args):
     cfg = load_config(args.config)
     seed = int(cfg.get('train', {}).get('seed', 3407))
     set_seed(seed)
-    # Build dataloaders first (dataset may spawn workers later)
+
+    # Load and normalize DeepSpeed config early so we can align batch sizes and scheduler steps
+    ds_config_path = Path(args.deepspeed_config)
+    assert ds_config_path.exists(), f"DeepSpeed config not found: {ds_config_path}"
+    with open(ds_config_path, 'r', encoding='utf-8') as f:
+        import json
+        ds_config = json.load(f)
+
+    # Align dataloader batch size to DS micro batch size for correctness
+    micro_bs = int(ds_config.get('train_micro_batch_size_per_gpu') or ds_config.get('train_batch_size', 8))
+    cfg.setdefault('data', {})
+    cfg['data']['batch_size'] = micro_bs
+
+    # Build dataloaders after alignment
     train_loader, val_loader, _ = build_dataloaders(cfg)
+
+    # Infer total optimizer steps for scheduler, if provided
+    epochs = int(cfg.get('train', {}).get('epochs', args.epochs))
+    acc_steps = int(ds_config.get('gradient_accumulation_steps', 1))
+    steps_per_epoch = max(1, len(train_loader) // max(1, acc_steps))
+    total_num_steps = max(1, epochs * steps_per_epoch)
+    if 'scheduler' in ds_config and isinstance(ds_config['scheduler'], dict):
+        sch = ds_config['scheduler']
+        params = sch.setdefault('params', {})
+        # Sync warmup_max_lr with optimizer lr
+        if 'optimizer' in ds_config and isinstance(ds_config['optimizer'], dict):
+            opt_lr = ds_config['optimizer'].get('params', {}).get('lr')
+            if opt_lr is not None:
+                params['warmup_max_lr'] = opt_lr
+        # If warmup_num_steps is a fraction (<1), convert to integer steps
+        wms = params.get('warmup_num_steps', None)
+        if isinstance(wms, float) and wms > 0.0 and wms < 1.0:
+            params['warmup_num_steps'] = max(1, int(round(wms * total_num_steps)))
+        elif isinstance(wms, int):
+            # keep as is
+            pass
+        else:
+            # default to 5% if unspecified or invalid
+            params['warmup_num_steps'] = max(1, int(round(0.05 * total_num_steps)))
+        params['total_num_steps'] = total_num_steps
 
     # Build composite trainer module (embedder + adapter + LLM)
     net = VLLMTrainer(cfg)
     print(f"Model built. Total params: {sum(p.numel() for p in net.parameters()):,}")
 
-    ds_config_path = Path(args.deepspeed_config)
-    assert ds_config_path.exists(), f"DeepSpeed config not found: {ds_config_path}"
-    with open(ds_config_path, 'r', encoding='utf-8') as f:
-        import json
-
-        ds_config = json.load(f)
-
     net = cast_model(net, get_cast_type(ds_config))
     print(f"Model cast to {next(net.parameters()).dtype}.")
 
     engine, optimizer, _, scheduler = deepspeed.initialize(
-        args=args, model=net, model_parameters=net.parameters()
+        args=args, model=net, model_parameters=net.parameters(), config_params=ds_config
     )
 
     # Resolve run/ckpt directories (support resume) with consistent RUN_ID across ranks
