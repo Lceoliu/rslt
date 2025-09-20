@@ -183,25 +183,62 @@ class LLMWithVisualPrefix(nn.Module):
         temperature: float = 1.0,
         top_k: int = 0,
     ) -> List[str]:
-        """Generate text starting from current prefix_past using <BOT> as the first input.
+        """Greedy decode starting from current prefix_past using <BOT> as the first input.
 
         Returns: list of strings length B.
         """
         device = next(self.model.parameters()).device
-        B = len(self.prefix_past[0][0]) if (self.prefix_past is not None) else 1  # fallback
-        bot_ids = torch.full((B, 1), self.bot_token_id, dtype=torch.long, device=device)
-        gen = self.model.generate(
-            input_ids=bot_ids,
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            temperature=temperature,
-            top_k=top_k if top_k > 0 else None,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            use_cache=True,
-            past_key_values=self.prefix_past,
-        )
-        # gen includes the BOT token at position 0; strip it
-        gen_no_bot = gen[:, 1:]
-        texts = self.tokenizer.batch_decode(gen_no_bot, skip_special_tokens=True)
+        if self.prefix_past is None:
+            # No prefix; fallback to just BOT
+            B = 1
+        else:
+            try:
+                B = self.prefix_past[0][0].size(0)
+            except Exception:
+                B = 1
+
+        # Start with BOT token
+        input_ids = torch.full((B, 1), self.bot_token_id, dtype=torch.long, device=device)
+        outputs = self.model(input_ids=input_ids, use_cache=True, past_key_values=self.prefix_past)
+        past = outputs.past_key_values
+        sequences = []  # collect generated token ids per step
+        prev_tokens = None
+
+        for step in range(max_new_tokens):
+            if prev_tokens is None:
+                # use last token of current outputs (BOT)
+                logits = outputs.logits[:, -1, :]
+            else:
+                out = self.model(input_ids=prev_tokens, use_cache=True, past_key_values=past)
+                past = out.past_key_values
+                logits = out.logits[:, -1, :]
+
+            if do_sample:
+                # basic temperature sampling with optional top_k
+                logits = logits / max(1e-6, float(temperature))
+                if top_k and top_k > 0:
+                    topk_vals, topk_idx = torch.topk(logits, k=min(top_k, logits.size(-1)), dim=-1)
+                    probs = torch.softmax(topk_vals, dim=-1)
+                    next_idx = torch.multinomial(probs, num_samples=1)
+                    next_tokens = topk_idx.gather(-1, next_idx)
+                else:
+                    probs = torch.softmax(logits, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1)
+            else:
+                next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+
+            sequences.append(next_tokens)
+            prev_tokens = next_tokens
+
+            # Early stop if all have produced eos
+            eos = self.tokenizer.eos_token_id
+            if eos is not None:
+                if torch.all(prev_tokens.squeeze(-1) == eos):
+                    break
+
+        if sequences:
+            gen_ids = torch.cat(sequences, dim=1)  # [B, L]
+        else:
+            gen_ids = torch.zeros((B, 0), dtype=torch.long, device=device)
+        texts = self.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)
         return texts

@@ -309,7 +309,7 @@ def train(args):
                     print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
                     # Sample a few predictions for inspection
                     try:
-                        sample_and_log_predictions(engine, val_loader, cfg, global_step)
+                        sample_and_log_predictions(engine, val_loader, cfg, global_step, writer)
                     except Exception as e:
                         print(f"[warn] sample_and_log_predictions failed: {e}")
                 # Save checkpoint on all ranks to avoid deadlocks
@@ -351,7 +351,7 @@ def evaluate(engine, loader: DataLoader) -> float:
 
 
 @torch.no_grad()
-def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], global_step: int) -> None:
+def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], global_step: int, writer=None) -> None:
     """Randomly sample 3~5 items from val loader, run streaming inference and log results.
     Rank0 only. Keeps the engine/module state intact.
     """
@@ -363,6 +363,12 @@ def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], 
     stride = getattr(module, 'stride', 8)
     drop_last = getattr(module, 'drop_last', True)
     nsamples = random.randint(3, 5)
+    # Decoding parameters from config (real inference settings)
+    dec_cfg = cfg.get('decoding', {})
+    max_new_tokens = int(dec_cfg.get('max_new_tokens', 48))
+    do_sample = bool(dec_cfg.get('do_sample', False))
+    temperature = float(dec_cfg.get('temperature', 1.0))
+    top_k = int(dec_cfg.get('top_k', 0))
     collected = 0
     # Randomly choose starting batch index to avoid always sampling from the beginning
     start_offset = random.randint(0, 3)
@@ -400,17 +406,31 @@ def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], 
             if (N - 1) not in chunk_points:
                 chunk_points.append(N - 1)
             # Log header
-            logging.info(f"step {global_step} val, batch_index={bidx}, sample batch id {i}, gt: \"{single_text[0]}\", total chunks: {N}")
+            header = f"step {global_step} val, batch_index={bidx}, sample batch id {i}, gt: \"{single_text[0]}\", total chunks: {N}"
+            logging.info(header)
+            tb_lines = [header]
             # Iterate and generate
             module.llm.reset_prefix_cache()
             for ci in range(N):
                 module.llm.step_prefix(prefix_seq[:, ci])
                 if ci in chunk_points:
                     try:
-                        pred = module.llm.generate_from_prefix(max_new_tokens=48, do_sample=False)
-                        logging.info(f"  chunk {ci} predict: \"{pred[0]}\"")
+                        pred = module.llm.generate_from_prefix(
+                            max_new_tokens=max_new_tokens,
+                            do_sample=do_sample,
+                            temperature=temperature,
+                            top_k=top_k,
+                        )
+                        line = f"  chunk {ci} predict: \"{pred[0]}\""
+                        logging.info(line)
+                        tb_lines.append(line)
                     except Exception as e:
-                        logging.info(f"  chunk {ci} predict: <generation failed: {e}>")
+                        line = f"  chunk {ci} predict: <generation failed: {e}>"
+                        logging.info(line)
+                        tb_lines.append(line)
+            # Write to TensorBoard as a single text block
+            if writer is not None:
+                writer.add_text('val/sample', "\n".join(tb_lines), global_step)
             collected += 1
             if collected >= nsamples:
                 break

@@ -53,3 +53,9 @@ streaming:
   loss_reduction: mean
 
 nclass: 10
+
+decoding:
+  max_new_tokens: 48
+  do_sample: false
+  temperature: 1.0
+  top_k: 0
