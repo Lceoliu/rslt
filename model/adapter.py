@@ -35,6 +35,13 @@ class VisualAdapter(nn.Module):
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(hidden_dim, llm_dim * self.num_prefix_tokens),
         )
+        # Per-token projection used when the input already carries P tokens
+        self.token_net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+            nn.Linear(hidden_dim, llm_dim),
+        )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """Accept [B, D] or [B, N, D] and return prefix embeds.
@@ -54,5 +61,11 @@ class VisualAdapter(nn.Module):
             if self.num_prefix_tokens == 1:
                 return y.squeeze(2)  # [B, N, E]
             return y  # [B, N, P, E]
+        elif z.dim() == 4:
+            # Input already carries P tokens: [B, N, P, D] -> [B, N, P, E]
+            B, N, P, D = z.shape
+            z2 = z.reshape(B * N * P, D)
+            y = self.token_net(z2).view(B, N, P, self.llm_dim)
+            return y
         else:
             raise ValueError(f"Unexpected z.dim()={z.dim()} in VisualAdapter.forward")

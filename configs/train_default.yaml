@@ -1,16 +1,16 @@
 train:
   seed: 3407
-  epochs: 5
+  epochs: 10
   log_interval: 10
   val_interval: 100
   save_dir: runs/ckpts
   save_dir_root: runs
-  save_every: 60           # 0 disables periodic save; otherwise save every N steps
+  save_every: 100           # 0 disables periodic save; otherwise save every N steps
   resume_from: ''         # set to runs/{timestamp}/checkpoints or runs/{timestamp} to resume
   # dummy_loss: none   # ignored when LLM CE loss is used
 
 dataset:
-  data_dir: /2023234331/data/csl_dental
+  data_dir: /2023234331/data/shm/format_data/csl_shm
   # Optional augmentations used by dataset/my_dataset
   augmentations: "speed"  # "speed", "mask", 
   aug_prob: 0.5
@@ -27,7 +27,7 @@ model:
   fusion: "attention"  # "attention" "concat_mlp"
 
 data:
-  batch_size: 16
+  batch_size: 8
   num_workers: 4
   # If dataset.data_dir is not provided, fallback dummy will be used:
   T: 32
@@ -39,7 +39,7 @@ llm:
   model_name_or_path: /workspace/Qwen
   trust_remote_code: true
   max_text_len: 128
-  num_prefix_tokens: 1
+  num_prefix_tokens: 10
   adapter_hidden: 512
   freeze_lm: false
   gradient_checkpointing: false
@@ -50,12 +50,16 @@ streaming:
   window: 32
   stride: 16
   drop_last: true
-  loss_reduction: last
+  loss_reduction: mean # "mean" or "last"
+  # Randomly skip CE on some chunks to speed training and improve generalization
+  skip_loss_prob: 0.3       # e.g., 0.5 to keep ~half the chunks
+  keep_first: true          # always compute loss on first chunk
+  always_keep_last: true    # always compute loss on last chunk
 
 nclass: 10
 
 decoding:
   max_new_tokens: 48
-  do_sample: false
+  do_sample: true
   temperature: 1.0
   top_k: 0

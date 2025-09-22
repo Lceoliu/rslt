@@ -98,7 +98,7 @@ class STGCNBackbone(nn.Module):
             STGCNBlock(128, embed_dim, A, stride=2),
         ])
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None, return_seq: bool = False) -> torch.Tensor:
         N, C, T, V = x.shape
         x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)
         x = x.to(self.data_bn.weight.dtype)
@@ -106,15 +106,25 @@ class STGCNBackbone(nn.Module):
         x = x.view(N, V, C, T).permute(0, 2, 3, 1).contiguous()
         for blk in self.blocks:
             x = blk(x)
-        if mask is None:
-            x = F.avg_pool2d(x, x.shape[-2:])
-            return x.flatten(1)
-        else:
-            m = mask.to(x.dtype).unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
-            To = x.size(2)
-            if m.size(2) != To:
-                m = F.interpolate(m, size=(To, 1), mode='nearest')
-            x = (x * m).sum(dim=2) / (m.sum(dim=2).clamp_min(1e-6))  # [N, D, V]
-            x = x.mean(dim=-1)  # [N, D]
+        To = x.size(2)
+        if return_seq:
+            if mask is not None:
+                m = mask.to(x.dtype).unsqueeze(1).unsqueeze(-1)
+                if m.size(2) != To:
+                    m = F.interpolate(m, size=(To, 1), mode='nearest')
+                x = x * m
+            x = x.mean(dim=-1)  # [N, D, To]
+            x = x.permute(0, 2, 1).contiguous()  # [N, To, D]
             return x
+        else:
+            if mask is None:
+                x = F.avg_pool2d(x, x.shape[-2:])
+                return x.flatten(1)
+            else:
+                m = mask.to(x.dtype).unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
+                if m.size(2) != To:
+                    m = F.interpolate(m, size=(To, 1), mode='nearest')
+                x = (x * m).sum(dim=2) / (m.sum(dim=2).clamp_min(1e-6))  # [N, D, V]
+                x = x.mean(dim=-1)  # [N, D]
+                return x
 

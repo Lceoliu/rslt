@@ -3,6 +3,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from dataset.transform import NormalizeProcessor
 from .backbones.aagcn_minimal import AAGCNBackbone, build_adjacency_from_numpy
@@ -40,6 +41,61 @@ def _np_or_torch_to_nctv(
         return ten.to(device)
 
 
+class ChunkTransformerEncoder(nn.Module):
+    """Lightweight Transformer encoder to map variable-length sequence [B, T, D]
+    to fixed-length tokens [B, P, D_out]. Uses sinusoidal positional encoding and
+    simple linear interpolation to exactly P tokens after contextualization.
+    """
+
+    def __init__(
+        self,
+        d_in: int,
+        d_out: int,
+        preset_len: int = 1,
+        nhead: int = 4,
+        num_layers: int = 1,
+        dim_feedforward: int | None = None,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.preset_len = int(max(1, preset_len))
+        d_model = d_out
+        if dim_feedforward is None:
+            dim_feedforward = max(256, 4 * d_model)
+        self.in_proj = nn.Linear(d_in, d_model) if d_in != d_model else nn.Identity()
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, activation='gelu', batch_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+    @staticmethod
+    def _positional_encoding(B: int, T: int, D: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        # Sin-cos positional encoding
+        position = torch.arange(T, device=device, dtype=dtype).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, D, 2, device=device, dtype=dtype) * (-np.log(10000.0) / max(1, D)))
+        pe = torch.zeros(T, D, device=device, dtype=dtype)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0).expand(B, -1, -1)  # [B, T, D]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D_in] -> [B, P, D_out]
+        B, T, Din = x.shape
+        x = self.in_proj(x)
+        D = x.size(-1)
+        pe = self._positional_encoding(B, T, D, x.device, x.dtype)
+        x = x + pe
+        y = self.encoder(x)  # [B, T, D]
+        if self.preset_len == T:
+            return y
+        # Downsample/upsample to preset_len via linear interpolation along time
+        yT = y.transpose(1, 2)  # [B, D, T]
+        yT2 = F.interpolate(yT, size=self.preset_len, mode='linear', align_corners=False)
+        out = yT2.transpose(1, 2).contiguous()  # [B, P, D]
+        return out
+
+
 class MultiPartGCNModel(nn.Module):
 
     def __init__(
@@ -50,10 +106,12 @@ class MultiPartGCNModel(nn.Module):
         out_embed_dim: int = 512,
         drop_conf: bool = True,
         fusion: str = "attention",  # "attention" "concat_mlp"
+        preset_len: int = 1,
     ) -> None:
         super().__init__()
         self.parts = parts or PARTS_DEFAULT
         self.drop_conf = drop_conf
+        self.preset_len = int(max(1, preset_len))
 
         # Build per-part adjacency via NormalizeProcessor (static)
         proc = NormalizeProcessor()
@@ -75,6 +133,17 @@ class MultiPartGCNModel(nn.Module):
             self.fusion = AttentionFusion(part_dims, out_embed_dim, d_model=min(256, part_embed_dim))
         else:
             self.fusion = ConcatMLPFusion(part_dims, out_embed_dim, hidden_dim=max(512, out_embed_dim))
+
+        # Chunk-level sequence encoder to fixed number of tokens per chunk
+        self.chunk_encoder = ChunkTransformerEncoder(
+            d_in=out_embed_dim,
+            d_out=out_embed_dim,
+            preset_len=self.preset_len,
+            nhead=8,
+            num_layers=4,
+            dim_feedforward=max(256, 4 * out_embed_dim),
+            dropout=0.1,
+        )
 
     def forward(self, parts_kpts: Dict[str, np.ndarray | torch.Tensor], pose_len: Optional[torch.Tensor | np.ndarray] = None) -> torch.Tensor:
         device = next(self.parameters()).device
@@ -123,7 +192,7 @@ class MultiPartGCNModel(nn.Module):
     ) -> torch.Tensor:
         """Encode sliding-window chunks to a sequence of embeddings.
 
-        Returns: Tensor[B, N_chunks, D]
+        Returns: Tensor[B, N_chunks, P, D]
         """
         device = next(self.parameters()).device
         # Normalize pose_len
@@ -159,27 +228,41 @@ class MultiPartGCNModel(nn.Module):
                     return x[:, s : s + w]
                 return x[s : s + w]
 
-        feats_seq = []  # list of [B, D]
+        feats_seq = []  # list of [B, P, D]
         B_ref: Optional[int] = None
         for s in starts:
             # Build per-chunk features then fuse
-            chunk_feats = []
-            chunk_mask: Optional[torch.Tensor] = None
+            chunk_feats_seq: List[torch.Tensor] = []  # each [B, t', Dp] for every part
+            chunk_mask: Optional[torch.Tensor] = None  # [B, t_raw]
             for part in self.parts:
-                k_all = parts_kpts[part]
+                k_all = parts_kpts[part]  # [B, T, V, C] or [T, V, C]
                 k_chunk = _slice_time(k_all, s, window)  # [B,w,V,C] or [w,V,C]
-                x = _np_or_torch_to_nctv(k_chunk, drop_conf=self.drop_conf, device=device)
+                x = _np_or_torch_to_nctv(
+                    k_chunk, drop_conf=self.drop_conf, device=device
+                )  # [B, C, w, V]
                 if B_ref is None:
                     B_ref = x.size(0)
                 # per-chunk mask
                 if pose_len is not None:
                     t = x.size(2)  # <= window (may be shorter if np slice)
-                    m = torch.arange(t, device=device).unsqueeze(0).expand(B_ref, -1)
+                    m = (
+                        torch.arange(t, device=device).unsqueeze(0).expand(B_ref, -1)
+                    )  # [B, w]
                     chunk_mask = (m + s < pose_len.view(-1, 1)).to(x.dtype)
-                y = self.backbones[part](x, mask=chunk_mask)  # [B, Dp]
-                chunk_feats.append(y)
-            z = self.fusion(chunk_feats)  # [B, D]
-            feats_seq.append(z)
+                # Get per-time features for this chunk
+                y_seq = self.backbones[part](x, mask=chunk_mask, return_seq=True)  # [B, t', Dp]
+                chunk_feats_seq.append(y_seq)
+            # Fuse across parts per time step by flattening time into batch
+            t_prime = min(f.shape[1] for f in chunk_feats_seq)
+            # Align time lengths if needed (should be same; safeguard by min crop)
+            chunk_feats_seq = [f[:, :t_prime] for f in chunk_feats_seq]
+            # Flatten time into batch
+            flat_parts = [f.reshape(-1, f.size(-1)) for f in chunk_feats_seq]  # list of [B*t', Dp]
+            z_flat = self.fusion(flat_parts)  # [B*t', D]
+            z_seq = z_flat.view(B_ref, t_prime, -1)  # [B, t', D]
+            # Encode to fixed P tokens
+            z_tok = self.chunk_encoder(z_seq)  # [B, P, D]
+            feats_seq.append(z_tok)
 
-        z_seq = torch.stack(feats_seq, dim=1)  # [B, N_chunks, D]
+        z_seq = torch.stack(feats_seq, dim=1)  # [B, N_chunks, P, D]
         return z_seq

@@ -105,7 +105,7 @@ class STGCNBlock(nn.Module):
 
 
 class AAGCNBackbone(nn.Module):
-    """Compact AAGCN-like backbone producing a global embedding.
+    """Compact AAGCN-like backbone producing either per-frame features or a global embedding.
 
     Args:
         in_channels: input channel count (e.g., 2 for xy or 3 for xy+conf)
@@ -129,7 +129,7 @@ class AAGCNBackbone(nn.Module):
             STGCNBlock(128, embed_dim, A, stride=2),
         ])
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None, return_seq: bool = False) -> torch.Tensor:
         # x: [N, C, T, V]; mask: [N, T] with 1 for valid frames
         N, C, T, V = x.shape
         x = x.permute(0, 3, 1, 2).contiguous().view(N, V * C, T)  # [N, VC, T]
@@ -142,28 +142,41 @@ class AAGCNBackbone(nn.Module):
 
         for blk in self.st_blocks:
             x = blk(x)
-
-        # Mask-aware spatiotemporal average pooling
-        if mask is None:
-            x = F.avg_pool2d(x, x.shape[-2:])  # [N, D, 1, 1]
-            return x.flatten(1)
-        else:
-            m = mask.to(x.dtype).unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
-            # Downsample/upsample mask to match temporal dim after strides
-            To = x.size(2)
-            if m.size(2) != To:
-                m = F.interpolate(m, size=(To, 1), mode='nearest')
-            x = (x * m).sum(dim=2) / (m.sum(dim=2).clamp_min(1e-6))  # [N, D, V]
-            x = x.mean(dim=-1)  # [N, D]
+        To = x.size(2)
+        if return_seq:
+            # Return per-time features [N, To, D]: mask-aware along time only, average over joints V
+            if mask is not None:
+                m = mask.to(x.dtype).unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
+                if m.size(2) != To:
+                    m = F.interpolate(m, size=(To, 1), mode='nearest')
+                x = x * m  # zero out invalid frames
+            x = x.mean(dim=-1)  # [N, D, To]
+            x = x.permute(0, 2, 1).contiguous()  # [N, To, D]
             return x
+        else:
+            # Mask-aware spatiotemporal average pooling -> [N, D]
+            if mask is None:
+                x = F.avg_pool2d(x, x.shape[-2:])  # [N, D, 1, 1]
+                return x.flatten(1)
+            else:
+                m = mask.to(x.dtype).unsqueeze(1).unsqueeze(-1)  # [N,1,T_in,1]
+                # Downsample/upsample mask to match temporal dim after strides
+                if m.size(2) != To:
+                    m = F.interpolate(m, size=(To, 1), mode='nearest')
+                x = (x * m).sum(dim=2) / (m.sum(dim=2).clamp_min(1e-6))  # [N, D, V]
+                x = x.mean(dim=-1)  # [N, D]
+                return x
 
 
 def build_adjacency_from_numpy(A_np) -> torch.Tensor:
     """Helper to convert np.ndarray adjacency to torch.Tensor[float32]."""
-    if hasattr(A_np, "astype"):
-        import numpy as np  # local import
+    import numpy as np
 
-        if isinstance(A_np, dict):
-            A_np = A_np.get("fullbody")
-        A_np = A_np.astype("float32")
-    return torch.from_numpy(A_np)
+    if isinstance(A_np, dict):
+        if "fullbody" in A_np:
+            A_np = A_np["fullbody"]
+        else:
+            A_np = next(iter(A_np.values()))
+    if hasattr(A_np, "astype"):
+        A_np = A_np.astype("float32", copy=False)
+    return torch.from_numpy(A_np.copy())

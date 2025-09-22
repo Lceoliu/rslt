@@ -96,6 +96,10 @@ class VLLMTrainer(nn.Module):
         self.stride = int(s_cfg.get('stride', 8))
         self.drop_last = bool(s_cfg.get('drop_last', True))
         self.loss_reduction = str(s_cfg.get('loss_reduction', 'mean'))
+        # Random loss skipping for streaming chunks
+        self.skip_loss_prob = float(s_cfg.get('skip_loss_prob', 0.0))
+        self.keep_first = bool(s_cfg.get('keep_first', True))
+        self.always_keep_last = bool(s_cfg.get('always_keep_last', True))
 
     def forward(self, batch):
         # Accept my_dataset dict or fallback tuple/list
@@ -124,7 +128,14 @@ class VLLMTrainer(nn.Module):
             prefix_seq = self.adapter(z_seq)  # [B, N, E] (P=1)
             if texts is None:
                 return 1e-6 * (z_seq ** 2).mean()
-            return self.llm.forward_stream(prefix_seq, texts, reduction=self.loss_reduction)
+            return self.llm.forward_stream(
+                prefix_seq,
+                texts,
+                reduction=self.loss_reduction,
+                skip_prob=self.skip_loss_prob,
+                keep_first=self.keep_first,
+                always_keep_last=self.always_keep_last,
+            )
         else:
             z = self.embedder(parts, pose_len=pose_len)  # [B, D]
             prefix = self.adapter(z)  # [B, P, E]

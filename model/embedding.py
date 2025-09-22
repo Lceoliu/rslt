@@ -17,6 +17,9 @@ def build_model_from_config(cfg: Dict[str, Any]) -> MultiPartGCNModel:
     out_embed_dim = int(mcfg.get("embed_dim", 512))
     drop_conf = bool(mcfg.get("drop_conf", True))
     fusion = mcfg.get("fusion", "concat_mlp")
+    # Preset length for per-chunk tokens: prefer llm.num_prefix_tokens if available
+    llm_cfg = cfg.get("llm", {})
+    preset_len = int(mcfg.get("preset_len", llm_cfg.get("num_prefix_tokens", 1)))
     return MultiPartGCNModel(
         parts=parts,
         backbone=backbone,
@@ -24,6 +27,7 @@ def build_model_from_config(cfg: Dict[str, Any]) -> MultiPartGCNModel:
         out_embed_dim=out_embed_dim,
         drop_conf=drop_conf,
         fusion=fusion,
+        preset_len=preset_len,
     )
 
 

@@ -12,6 +12,7 @@ import torch
 
 try:
     import deepspeed  # type: ignore
+    from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint  # type: ignore
 except Exception as e:
     raise RuntimeError("DeepSpeed not installed. Install via: pip install deepspeed") from e
 
@@ -183,22 +184,43 @@ def main():
     stride = int(args.stride) if args.stride is not None else int(s_cfg.get('stride', 8))
     drop_last = bool(args.drop_last) if args.drop_last is not None else bool(s_cfg.get('drop_last', True))
 
-    # Build model and engine
+    # Build model and load ZeRO checkpoint by merging shards (works for different DP sizes)
     net = VLLMTrainer(cfg)
     net = cast_model(net, get_cast_type(ds_config))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    net.to(device)
     net.eval()
-    engine, _, _, _ = deepspeed.initialize(model=net, model_parameters=net.parameters(), config_params=ds_config)
 
-    # Resolve checkpoint dir
     ckpt_dir = Path(args.checkpoint)
     if ckpt_dir.name != 'checkpoints':
         ckpt_dir = ckpt_dir / 'checkpoints'
     assert ckpt_dir.exists(), f"Checkpoint dir not found: {ckpt_dir}"
-    load_path, _ = engine.load_checkpoint(str(ckpt_dir), tag=None)
-    print(f"Loaded checkpoint from: {load_path}")
+    try:
+        load_state_dict_from_zero_checkpoint(net, str(ckpt_dir))
+        print(f"Loaded (merged) ZeRO checkpoint from: {ckpt_dir}")
+    except Exception as e:
+        # Fallback: try to find a single-state dict
+        print(f"[warn] zero_to_fp32 merge failed: {e}. Trying to load a single state_dict...")
+        # Common filenames
+        cand = None
+        for name in [
+            'pytorch_model.bin',
+            'model_fp32.pt',
+            'mp_rank_00_model_states.pt',
+        ]:
+            p = ckpt_dir / name
+            if p.exists():
+                cand = p
+                break
+        if cand is None:
+            raise RuntimeError(f"No valid state dict file found in {ckpt_dir}")
+        sd = torch.load(cand, map_location='cpu')
+        if isinstance(sd, dict) and 'module' in sd:
+            sd = sd['module']
+        missing, unexpected = net.load_state_dict(sd, strict=False)
+        print(f"Loaded fallback state_dict: missing={len(missing)} unexpected={len(unexpected)}")
 
     results: Dict[str, Any] = {}
-    device = engine.device
 
     if args.mode == 'single':
         assert args.npy and Path(args.npy).exists(), "For mode=single, --npy must be provided"
@@ -207,7 +229,7 @@ def main():
         parts = {k: torch.from_numpy(v).unsqueeze(0).to(device) for k, v in parts_np.items()}  # [1,T,V,C]
         pose_len = torch.tensor([T], device=device)
         sample = stream_predict_for_sample(
-            engine.module,
+            net,
             parts,
             pose_len,
             text_gt="",
@@ -234,7 +256,7 @@ def main():
             text_list = batch.get('text', None)
             text = text_list[0] if text_list is not None and len(text_list) > 0 else ""
             sample = stream_predict_for_sample(
-                engine.module,
+                net,
                 parts,
                 pose_len,
                 text_gt=text,
@@ -260,4 +282,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
