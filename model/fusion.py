@@ -25,7 +25,7 @@ class ConcatMLPFusion(nn.Module):
 
 
 class AttentionFusion(nn.Module):
-    def __init__(self, in_dims: List[int], out_dim: int, d_model: int = 256, nhead: int = 4, dropout: float = 0.1):
+    def __init__(self, in_dims: List[int], out_dim: int, d_model: int = 512, nhead: int = 8, dropout: float = 0.1):
         super().__init__()
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
         self.projs = nn.ModuleList([nn.Linear(d, d_model) for d in in_dims])

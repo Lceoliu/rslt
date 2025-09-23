@@ -1,19 +1,19 @@
 train:
   seed: 3407
-  epochs: 10
+  epochs: 20
   log_interval: 10
-  val_interval: 100
+  val_interval: 200
   save_dir: runs/ckpts
   save_dir_root: runs
-  save_every: 100           # 0 disables periodic save; otherwise save every N steps
+  save_every: 400           # 0 disables periodic save; otherwise save every N steps
   resume_from: ''         # set to runs/{timestamp}/checkpoints or runs/{timestamp} to resume
   # dummy_loss: none   # ignored when LLM CE loss is used
 
 dataset:
   data_dir: /2023234331/data/shm/format_data/csl_shm
   # Optional augmentations used by dataset/my_dataset
-  augmentations: "speed"  # "speed", "mask", 
-  aug_prob: 0.5
+  augmentations: ""  # "speed", "mask", 
+  aug_prob: 0.0
   aug_speed_min: 0.9
   aug_speed_max: 1.1
   aug_mask_prob: 0.05
@@ -21,26 +21,27 @@ dataset:
 model:
   parts: ["body", "face", "left_hand", "right_hand", "fullbody"]
   backbone: "aagcn"  # or "stgcn"
-  part_embed_dim: 256
-  out_embed_dim: 512
+  part_embed_dim: 512
+  out_embed_dim: 1024
   drop_conf: true
   fusion: "attention"  # "attention" "concat_mlp"
 
 data:
-  batch_size: 8
+  batch_size: 4
   num_workers: 4
   # If dataset.data_dir is not provided, fallback dummy will be used:
   T: 32
   train_length: 256
   val_length: 128
+  conf_threshold: 0.1
   # custom_builder: your_module:your_builder  # returns (train_loader, val_loader, nclass)
 
 llm:
   model_name_or_path: /workspace/Qwen
   trust_remote_code: true
   max_text_len: 128
-  num_prefix_tokens: 10
-  adapter_hidden: 512
+  num_prefix_tokens: 16
+  adapter_hidden: 1024
   freeze_lm: false
   gradient_checkpointing: false
   bot_token: "<BOT>"
@@ -52,7 +53,7 @@ streaming:
   drop_last: true
   loss_reduction: mean # "mean" or "last"
   # Randomly skip CE on some chunks to speed training and improve generalization
-  skip_loss_prob: 0.3       # e.g., 0.5 to keep ~half the chunks
+  skip_loss_prob: 0.1       # e.g., 0.5 to keep ~half the chunks
   keep_first: true          # always compute loss on first chunk
   always_keep_last: true    # always compute loss on last chunk
 

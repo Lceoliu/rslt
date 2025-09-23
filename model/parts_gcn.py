@@ -130,7 +130,9 @@ class MultiPartGCNModel(nn.Module):
             part_dims.append(part_embed_dim)
 
         if fusion == "attention":
-            self.fusion = AttentionFusion(part_dims, out_embed_dim, d_model=min(256, part_embed_dim))
+            self.fusion = AttentionFusion(
+                part_dims, out_embed_dim, d_model=min(512, part_embed_dim)
+            )
         else:
             self.fusion = ConcatMLPFusion(part_dims, out_embed_dim, hidden_dim=max(512, out_embed_dim))
 
@@ -141,7 +143,7 @@ class MultiPartGCNModel(nn.Module):
             preset_len=self.preset_len,
             nhead=8,
             num_layers=4,
-            dim_feedforward=max(256, 4 * out_embed_dim),
+            dim_feedforward=max(512, 4 * out_embed_dim),
             dropout=0.1,
         )
 

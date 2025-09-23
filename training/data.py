@@ -66,7 +66,7 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, int]
         from dataset.my_dataset import create_dataloader
         from dataset.transform import NormalizeProcessor
 
-        transform = NormalizeProcessor()
+        transform = NormalizeProcessor(conf_threshold=cfg.get('conf_threshold', 0.1))
         train_loader = create_dataloader(
             ds_cfg, split='train', transform=transform,
             batch_size=batch_size, shuffle=True,
