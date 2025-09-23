@@ -401,14 +401,14 @@ def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], 
         return
     module = engine.module  # VLLMTrainer
     assert hasattr(module, 'embedder') and hasattr(module, 'adapter') and hasattr(module, 'llm')
-    window = getattr(module, 'window', 16)
-    stride = getattr(module, 'stride', 8)
+    window = getattr(module, 'window', 32)  # Use actual config values
+    stride = getattr(module, 'stride', 16)  # Use actual config values
     drop_last = getattr(module, 'drop_last', True)
     nsamples = random.randint(3, 5)
     # Decoding parameters from config (real inference settings)
     dec_cfg = cfg.get('decoding', {})
     max_new_tokens = int(dec_cfg.get('max_new_tokens', 48))
-    do_sample = bool(dec_cfg.get('do_sample', False))
+    do_sample = bool(dec_cfg.get('do_sample', True))  # Consistent with config
     temperature = float(dec_cfg.get('temperature', 1.0))
     top_k = int(dec_cfg.get('top_k', 0))
     collected = 0
@@ -441,9 +441,9 @@ def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], 
             # Streaming encode
             z_seq = module.embedder.encode_chunks(single_parts, single_len, window, stride, drop_last)  # [1, N, D]
             prefix_seq = module.adapter(z_seq)  # [1, N, E]
-            # Decode at a few chunk milestones
+            # Decode at more frequent chunk milestones for better supervision
             N = prefix_seq.shape[1]
-            step = max(1, N // 5)
+            step = max(1, N // 10)  # Increased sampling frequency from N//5 to N//10
             chunk_points = list(range(0, N, step))
             if (N - 1) not in chunk_points:
                 chunk_points.append(N - 1)

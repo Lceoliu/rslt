@@ -29,7 +29,8 @@ def _build_test_loader(cfg: Dict[str, Any], split: str = 'test') -> Any:
 
     data_cfg = cfg.get('dataset', {})
     assert data_cfg and data_cfg.get('data_dir'), "dataset.data_dir must be provided in config to run test mode."
-    transform = NormalizeProcessor()
+    conf_threshold = cfg.get('data', {}).get('conf_threshold', 0.1)
+    transform = NormalizeProcessor(conf_threshold=conf_threshold)
     loader = create_dataloader(
         data_cfg,
         split=split,
@@ -48,7 +49,7 @@ def _normalize_single_npy(npy_path: str) -> Tuple[Dict[str, np.ndarray], int]:
     from dataset.transform import NormalizeProcessor
 
     arr = np.load(npy_path)  # [T, 134, 3]
-    proc = NormalizeProcessor()
+    proc = NormalizeProcessor(conf_threshold=0.1)  # Use consistent threshold
     parts = proc(arr)
     T = next(iter(parts.values())).shape[0]
     return parts, T

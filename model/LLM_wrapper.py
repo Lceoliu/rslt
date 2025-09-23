@@ -412,13 +412,13 @@ class LLMWithVisualPrefix(nn.Module):
             sequences.append(next_tokens)
             prev_tokens = next_tokens
 
-            # Early stop if all have produced eos or <EOT>
+            # Early stop if any sample has produced eos or <EOT>
             eos = self.tokenizer.eos_token_id
             if eos is not None:
-                if torch.all(prev_tokens.squeeze(-1) == eos):
+                if torch.any(prev_tokens.squeeze(-1) == eos):
                     break
             if self.eot_token_id is not None:
-                if torch.all(prev_tokens.squeeze(-1) == self.eot_token_id):
+                if torch.any(prev_tokens.squeeze(-1) == self.eot_token_id):
                     break
 
         if sequences:

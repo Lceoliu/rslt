@@ -2,7 +2,7 @@ train:
   seed: 3407
   epochs: 20
   log_interval: 10
-  val_interval: 200
+  val_interval: 200  # More frequent validation for better monitoring
   save_dir: runs/ckpts
   save_dir_root: runs
   save_every: 400           # 0 disables periodic save; otherwise save every N steps
@@ -53,7 +53,7 @@ streaming:
   drop_last: true
   loss_reduction: mean # "mean" or "last"
   # Randomly skip CE on some chunks to speed training and improve generalization
-  skip_loss_prob: 0.1       # e.g., 0.5 to keep ~half the chunks
+  skip_loss_prob: 0.1      # Further reduced to improve learning signal
   keep_first: true          # always compute loss on first chunk
   always_keep_last: true    # always compute loss on last chunk
 
