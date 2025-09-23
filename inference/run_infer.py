@@ -18,9 +18,11 @@ except Exception as e:
 
 from model.config import load_config
 from training.train_deepspeed import VLLMTrainer, cast_model, get_cast_type  # reuse trainer and helpers
+from training.utils import set_seed
+from tqdm import tqdm
 
 
-def _build_test_loader(cfg: Dict[str, Any]) -> Any:
+def _build_test_loader(cfg: Dict[str, Any], split: str = 'test') -> Any:
     # Prefer dataset.my_dataset with batch_size=1
     from dataset.my_dataset import create_dataloader
     from dataset.transform import NormalizeProcessor
@@ -30,7 +32,7 @@ def _build_test_loader(cfg: Dict[str, Any]) -> Any:
     transform = NormalizeProcessor()
     loader = create_dataloader(
         data_cfg,
-        split='test',
+        split=split,
         transform=transform,
         batch_size=1,
         shuffle=False,
@@ -157,8 +159,14 @@ def main():
     parser.add_argument('--drop_last', action='store_true', default=None)
     parser.add_argument('--bf16', action='store_true', default=True)
     parser.add_argument('--timing', type=str, default='total', choices=['total', 'llm'])
+    parser.add_argument(
+        "--split", type=str, default='test', choices=['train', 'val', 'test']
+    )  # check if the model can overfit a small set
+    parser.add_argument(
+        '--seed', type=int, default=3407, help='Random seed for reproducibility'
+    )
     args = parser.parse_args()
-
+    set_seed(args.seed)
     os.environ.setdefault('TOKENIZERS_PARALLELISM', 'false')
 
     cfg = load_config(args.config)
@@ -191,10 +199,15 @@ def main():
     net.to(device)
     net.eval()
 
+    split = args.split
+    print(
+        f"Running inference in {args.mode} mode on {split} set, max new tokens={max_new_tokens}, temperature={temperature}, top_k={top_k}, window={window}, stride={stride}, drop_last={drop_last}, bf16={args.bf16}, timing={args.timing}"
+    )
+
     ckpt_dir = Path(args.checkpoint)
-    if ckpt_dir.name != 'checkpoints':
-        ckpt_dir = ckpt_dir / 'checkpoints'
-    assert ckpt_dir.exists(), f"Checkpoint dir not found: {ckpt_dir}"
+    # if ckpt_dir.name != 'checkpoints':
+    #     ckpt_dir = ckpt_dir / 'checkpoints'
+    # assert ckpt_dir.exists(), f"Checkpoint dir not found: {ckpt_dir}"
     try:
         load_state_dict_from_zero_checkpoint(net, str(ckpt_dir))
         print(f"Loaded (merged) ZeRO checkpoint from: {ckpt_dir}")
@@ -221,6 +234,8 @@ def main():
         print(f"Loaded fallback state_dict: missing={len(missing)} unexpected={len(unexpected)}")
 
     results: Dict[str, Any] = {}
+    out_path = Path(args.output)
+    out_path.mkdir(parents=True, exist_ok=True)
 
     if args.mode == 'single':
         assert args.npy and Path(args.npy).exists(), "For mode=single, --npy must be provided"
@@ -247,8 +262,8 @@ def main():
         results[key] = sample
     else:
         # test mode: iterate dataset
-        loader = _build_test_loader(cfg)
-        for bidx, batch in enumerate(loader):
+        loader = _build_test_loader(cfg, split=split)
+        for bidx, batch in enumerate(tqdm(loader, desc="Inference")):
             # Each batch_size=1
             parts = {k: v.to(device) for k, v in batch['pose'].items()}
             pose_len = batch.get('pose_len', None)
@@ -272,10 +287,10 @@ def main():
             )
             key = f"test_batch{bidx}_index0"
             results[key] = sample
+            with open(out_path / "partial.json", 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
 
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, 'w', encoding='utf-8') as f:
+    with open(out_path / "full.json", 'w', encoding='utf-8') as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     print(f"Saved inference results to: {out_path}")
 

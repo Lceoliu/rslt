@@ -5,6 +5,7 @@ import numpy as np
 import json
 import time
 import os
+import pickle
 
 from .transform import NormalizeProcessor
 from torch.utils.data import Dataset, DataLoader
@@ -45,14 +46,20 @@ class MyDataset(Dataset):
             len(memmap_path) == 1
         ), f"Expected one .dat file in {self._data_dir}, found {len(memmap_path)}."
         meta_path = self._data_dir / 'meta.json'
+        if not meta_path.exists():
+            meta_path = self._data_dir / 'meta.pkl'
         assert meta_path.exists(), f"Meta file {meta_path} does not exist."
         annotation_path = self._data_dir / 'annotation.json'
         assert (
             annotation_path.exists()
         ), f"Annotation file {annotation_path} does not exist."
         print(f"Start loading dataset from {self._data_dir} ...")
-        with open(meta_path, 'r') as f:
-            meta = json.load(f)
+        if meta_path.suffix == '.pkl':
+            with open(meta_path, 'rb') as f:
+                meta = pickle.load(f)
+        else:
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
         with open(annotation_path, 'r') as f:
             self._annotations = json.load(f)
         try:
