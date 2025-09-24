@@ -51,19 +51,21 @@ class LLMWithVisualPrefix(nn.Module):
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Add BOT token
+        # Store special tokens
         self.bot_token = bot_token
-        self.tokenizer.add_special_tokens({"additional_special_tokens": [self.bot_token]})
-        # Add BOV/EOV/BOC/EOC/EOT tokens
         self.bov_token = bov_token
         self.eov_token = eov_token
         self.boc_token = boc_token
         self.eoc_token = eoc_token
         self.eot_token = eot_token
+        
+        # Add all special tokens at once to avoid overwriting
+        all_special_tokens = [
+            self.bot_token, self.bov_token, self.eov_token, 
+            self.boc_token, self.eoc_token, self.eot_token
+        ]
         self.tokenizer.add_special_tokens({
-            "additional_special_tokens": [
-                self.bov_token, self.eov_token, self.boc_token, self.eoc_token, self.eot_token
-            ]
+            "additional_special_tokens": all_special_tokens
         })
 
         self.model = AutoModelForCausalLM.from_pretrained(

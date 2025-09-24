@@ -336,10 +336,17 @@ def train(args):
                 except Exception:
                     pass
             if engine.global_rank == 0 and (global_step % log_interval == 0):
+                # Add more detailed logging
+                loss_val = loss.item()
                 if tqdm is None:
-                    print(f"epoch={epoch} step={global_step} loss={loss.item():.6f}")
+                    print(f"epoch={epoch} step={global_step} loss={loss_val:.6f}")
+                    # Log abnormal loss values
+                    if loss_val > 20 or loss_val < 0:
+                        print(f"WARNING: Abnormal loss value: {loss_val}")
                 else:
-                    iterable.set_postfix({"loss": f"{loss.item():.6f}"})
+                    iterable.set_postfix({"loss": f"{loss_val:.6f}"})
+                    if loss_val > 20 or loss_val < 0:
+                        print(f"WARNING: Abnormal loss value: {loss_val}")
             # Periodic checkpointing on all ranks
             if save_every > 0 and (global_step % save_every == 0):
                 engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epoch})

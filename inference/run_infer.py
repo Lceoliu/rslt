@@ -124,6 +124,10 @@ def stream_predict_for_sample(
             torch.cuda.synchronize(device)
             t0 = time.perf_counter()
         with torch.autocast(**autocast_kwargs):
+            # Debug: Check cache state before generation
+            if idx == idxs[0]:  # Only for first milestone
+                print(f"Cache state: past_key_values is {'not ' if module.llm.prefix_past is None else ''}None")
+                print(f"Generation params: do_sample={do_sample}, temp={temperature}, top_k={top_k}")
             out = module.llm.generate_from_prefix(
                 max_new_tokens=max_new_tokens,
                 do_sample=do_sample,
@@ -204,6 +208,11 @@ def main():
     print(
         f"Running inference in {args.mode} mode on {split} set, max new tokens={max_new_tokens}, temperature={temperature}, top_k={top_k}, window={window}, stride={stride}, drop_last={drop_last}, bf16={args.bf16}, timing={args.timing}"
     )
+    
+    # Debug: Print tokenizer info
+    print(f"Tokenizer vocab size: {len(net.llm.tokenizer)}")
+    print(f"Special tokens: BOT={net.llm.bot_token_id}, BOV={net.llm.bov_token_id}, EOV={net.llm.eov_token_id}")
+    print(f"Model dtype: {next(net.parameters()).dtype}")
 
     ckpt_dir = Path(args.checkpoint)
     # if ckpt_dir.name != 'checkpoints':
@@ -233,6 +242,10 @@ def main():
             sd = sd['module']
         missing, unexpected = net.load_state_dict(sd, strict=False)
         print(f"Loaded fallback state_dict: missing={len(missing)} unexpected={len(unexpected)}")
+        if len(missing) > 0:
+            print(f"Missing keys: {missing[:5]}...")  # Show first 5
+        if len(unexpected) > 0:
+            print(f"Unexpected keys: {unexpected[:5]}...")  # Show first 5
 
     results: Dict[str, Any] = {}
     out_path = Path(args.output)
@@ -253,7 +266,7 @@ def main():
             stride=stride,
             drop_last=drop_last,
             max_new_tokens=max_new_tokens,
-            do_sample=bool(dec.get('do_sample', False) if args.temperature is None else (args.top_k or 0) > 0 or args.temperature != 1.0),
+            do_sample=bool(dec.get('do_sample', True)),  # Use consistent sampling strategy
             temperature=temperature,
             top_k=top_k,
             bf16=bool(args.bf16),
@@ -280,7 +293,7 @@ def main():
                 stride=stride,
                 drop_last=drop_last,
                 max_new_tokens=max_new_tokens,
-                do_sample=bool(dec.get('do_sample', False) if args.temperature is None else (args.top_k or 0) > 0 or args.temperature != 1.0),
+                do_sample=bool(dec.get('do_sample', True)),  # Use consistent sampling strategy
                 temperature=temperature,
                 top_k=top_k,
                 bf16=bool(args.bf16),
