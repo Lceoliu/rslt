@@ -20,6 +20,14 @@ def build_model_from_config(cfg: Dict[str, Any]) -> MultiPartGCNModel:
     # Preset length for per-chunk tokens: prefer llm.num_prefix_tokens if available
     llm_cfg = cfg.get("llm", {})
     preset_len = int(mcfg.get("preset_len", llm_cfg.get("num_prefix_tokens", 1)))
+
+    uni_cfg = mcfg.get("uni_gcn", {})
+    uni_proj_raw = uni_cfg.get("proj_dim")
+    uni_proj_dim = int(uni_proj_raw) if uni_proj_raw is not None else None
+    uni_temporal_kernel = int(uni_cfg.get("temporal_kernel", 5))
+    uni_adaptive = bool(uni_cfg.get("adaptive", True))
+    uni_dropout = float(uni_cfg.get("dropout", 0.0))
+
     return MultiPartGCNModel(
         parts=parts,
         backbone=backbone,
@@ -28,6 +36,10 @@ def build_model_from_config(cfg: Dict[str, Any]) -> MultiPartGCNModel:
         drop_conf=drop_conf,
         fusion=fusion,
         preset_len=preset_len,
+        uni_proj_dim=uni_proj_dim,
+        uni_temporal_kernel=uni_temporal_kernel,
+        uni_adaptive=uni_adaptive,
+        uni_dropout=uni_dropout,
     )
 
 

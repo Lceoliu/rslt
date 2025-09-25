@@ -36,6 +36,14 @@ class MyDataset(Dataset):
 
         self._split_dataset()
 
+        self.min_reserved_ratio = self.config.get('min_reserved_ratio', 0.6)
+        self.pad_last = self.config.get('pad_last', True)
+        self.window = self.config.get('window', 32)
+        self.stride = self.config.get('stride', 16)
+        assert (
+            0.0 < self.min_reserved_ratio <= 1.0
+        ), "min_reserved_ratio must be in (0.0, 1.0]"
+
     def _load_data(self):
         self._data_dir = Path(self.config['data_dir'])
         assert (
@@ -58,9 +66,9 @@ class MyDataset(Dataset):
             with open(meta_path, 'rb') as f:
                 meta = pickle.load(f)
         else:
-            with open(meta_path, 'r') as f:
+            with open(meta_path, 'r', encoding='utf-8') as f:
                 meta = json.load(f)
-        with open(annotation_path, 'r') as f:
+        with open(annotation_path, 'r', encoding='utf-8') as f:
             self._annotations = json.load(f)
         try:
             self._memmap_data_type = np.dtype(meta['dtype'])
@@ -117,9 +125,11 @@ class MyDataset(Dataset):
 
             if got_lock:
                 all_ids = list(self._annotations.keys())
-                train_ids = all_ids[: int(len(all_ids) * 0.8)]
-                val_ids = all_ids[int(len(all_ids) * 0.8) : int(len(all_ids) * 0.9)]
-                test_ids = all_ids[int(len(all_ids) * 0.9) :]
+                # ensure must have one training sample
+                train_cnt = max(1, int(len(all_ids) * 0.8))
+                train_ids = all_ids[:train_cnt]
+                val_ids = all_ids[train_cnt : train_cnt + int(len(all_ids) * 0.1)]
+                test_ids = all_ids[train_cnt + int(len(all_ids) * 0.1) :]
                 split_data = {"train": train_ids, "val": val_ids, "test": test_ids}
                 _atomic_write_json(split_file, split_data)
             else:
@@ -212,7 +222,6 @@ class MyDataset(Dataset):
                     new_data[t, n, :] = 0.0
         return new_data
 
-    @lru_cache(maxsize=128)
     def get_pose(self, data_id: str) -> np.ndarray:
         if data_id not in self._annotations:
             raise ValueError(f"Data ID {data_id} not found in annotations.")
@@ -228,6 +237,11 @@ class MyDataset(Dataset):
         return len(self.data_ids)
 
     def __getitem__(self, idx):
+        """
+        我们保证，输出的pose的满足shape: [#Chunk, Chunk_Length, #Keypoints, Channel]
+        """
+        if idx < 0 or idx >= len(self):
+            raise IndexError("Index out of range.")
         data_id = self.data_ids[idx]
         annotation = self._annotations[data_id]
         sample = {}
@@ -246,17 +260,59 @@ class MyDataset(Dataset):
                 mask_prob = self.config.get('aug_mask_prob', 0.05)
                 pose = self.mask_augment(pose, mask_prob)
 
+        t_prime = pose.shape[0]
+        if self.pad_last:
+            # pad to fit sliding window
+            if t_prime < self.window:
+                pad_len = self.window - t_prime
+                pad_shape = (pad_len,) + pose.shape[1:]
+                pad_values = pose[-1:].repeat(pad_len, axis=0)
+                pose = np.concatenate([pose, pad_values], axis=0)
+            else:
+                remain = (t_prime - self.window) % self.stride
+                if remain != 0:
+                    pad_len = self.stride - remain
+                    pad_shape = (pad_len,) + pose.shape[1:]
+                    pad_values = pose[-1:].repeat(pad_len, axis=0)
+                    pose = np.concatenate([pose, pad_values], axis=0)
+            t_prime = pose.shape[0]
+        chunk_cnt = (t_prime - self.window) // self.stride + 1
+        min_reserved = max(1, int(chunk_cnt * self.min_reserved_ratio))
+        if chunk_cnt < min_reserved:
+            chunk_cnt = min_reserved
+        reversed_chunk_cnt = np.random.randint(min_reserved, chunk_cnt + 1)
+        assert 1 <= reversed_chunk_cnt <= chunk_cnt
+        reversed_t = (reversed_chunk_cnt - 1) * self.stride + self.window
+        if self.split != 'train':
+            reversed_t = t_prime  # use all frames for val/test
+        pose = pose[:reversed_t]
         if self.transform is not None:
             pose = self.transform(
                 pose
-            )  # {str: np.ndarray}, keypoints after normalization
+            )  # {str: np.ndarray}, keypoints after normalization, (T', K, C)
             pose = {k: torch.from_numpy(v) for k, v in pose.items()}
         else:
-            pose = torch.from_numpy(pose)  # (T, K, C)
+            pose = torch.from_numpy(pose)  # (T', K, C)
+
+        # cut to chunks for each part
+        def _slice_chunks(x: torch.Tensor) -> torch.Tensor:
+            # (T', K, C) -> (N, window, K, C)
+            assert (
+                x.shape[0] - self.window
+            ) % self.stride == 0, f"Data length {x.shape[0]} is not compatible with window {self.window} and stride {self.stride}."
+            return (
+                x.unfold(0, self.window, self.stride).contiguous().permute(0, 3, 1, 2)
+            )
+
+        pose = {
+            k: _slice_chunks(v) for k, v in pose.items()
+        }  # {str: Tensor}, (N, window, K, C)
+
         sample['pose'] = pose  # {str: Tensor} or Tensor
         sample['text'] = annotation['text']
-        sample['gloss'] = annotation.get('gloss', '').split()
-        sample['frame_cnt'] = T
+        sample['gloss'] = annotation.get('gloss', '').split()  # List[str] or []
+        sample['id'] = data_id
+        sample['frame_cnt'] = reversed_t
         sample['adjacency_matrix'] = {
             k: torch.from_numpy(v)
             for k, v in self.get_adjacency_matrix(normalize=True).items()
@@ -265,68 +321,85 @@ class MyDataset(Dataset):
 
 
 def my_collate_fn(batch):
+    """
+    对于最终输出的 pose，要求：
+    shape: [B, #Chunk, #Part, Chunk_Length, #Keypoints, Channel]
+    """
     batch_size = len(batch)
     assert batch_size > 0 and isinstance(batch[0]["pose"], dict), "pose 必须是字典"
 
     body_parts = list(batch[0]["pose"].keys())
 
-    def _get_T(item) -> int:
-        any_part = next(iter(item["pose"].values()))
-        return any_part.shape[0]
+    def _get_chunk_lens(item) -> int:
+        num_chunks = [item["pose"][part].shape[0] for part in body_parts]
+        assert all(
+            n == num_chunks[0] for n in num_chunks
+        ), "所有part的chunk数量必须相同"
+        return num_chunks[0]
 
-    # 维度 (K, C)
-    part_dims: Dict[str, Tuple[int, int]] = {
-        part: batch[0]["pose"][part].shape[1:] for part in body_parts
-    }
+    def _stack_parts(
+        poses: Dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        part_tensors = [
+            poses[part] for part in body_parts
+        ]  # List[Tensor], each (N, window, K_part, C)
+        part_lens = [t.shape[2] for t in part_tensors]
+        return (
+            torch.cat(part_tensors, dim=2),
+            part_lens,
+        )  # (N, window, sum(K_part), C), List[int]
 
-    for item in batch:
-        T0 = _get_T(item)
-        for part in body_parts:
-            assert item["pose"][part].shape[0] == T0, f"{part} 的 T 不一致"
-            assert (
-                item["pose"][part].shape[1:] == part_dims[part]
-            ), f"{part} 的 (K,C) 不一致"
+    padded_poses = []
+    pose_lens = []
+    text_list = []
+    gloss_list = []
+    gloss_lens = []
 
-    max_T = max(_get_T(item) for item in batch)
-
-    # 按 part 分别做 pad: (B, max_T, K, C)
-    padded_poses: Dict[str, torch.Tensor] = {}
-    for part in body_parts:
-        K, C = part_dims[part]
-        dtype = batch[0]["pose"][part].dtype
-        padded = torch.zeros((batch_size, max_T, K, C), dtype=dtype)
-        for i, item in enumerate(batch):
-            T = _get_T(item)
-            padded[i, :T] = item["pose"][part]
-        padded_poses[part] = padded
-
-    # 文本与 gloss 处理
-    text_list: List[str] = [item["text"] for item in batch]
-    has_gloss = ("gloss" in batch[0]) and (batch[0]["gloss"] is not None)
-    if has_gloss:
-        max_gloss_len = max(len(item["gloss"]) for item in batch)
-        gloss_list = []
-        for item in batch:
-            g = item["gloss"]
-            g = g + ["<pad>"] * (max_gloss_len - len(g))
-            gloss_list.append(g)
-    else:
-        gloss_list = None
-
-    pose_len = torch.tensor([_get_T(item) for item in batch], dtype=torch.long)
-    gloss_len = (
-        torch.tensor([len(item["gloss"]) for item in batch], dtype=torch.long)
-        if has_gloss
-        else None
+    max_chunks = max(_get_chunk_lens(item) for item in batch)
+    max_gloss_len = (
+        max(len(item['gloss']) for item in batch) if batch[0]['gloss'] else 0
     )
+    part_lens = None  # List[int], sum(K_part)
+    for i, item in enumerate(batch):
+        num_chunks = _get_chunk_lens(item)
+        pose_lens.append(num_chunks)
+        text_list.append(item['text'])
+        if item['gloss']:
+            gloss_list.append(item['gloss'])
+            gloss_lens.append(len(item['gloss']))
+        else:
+            gloss_list.append(None)
+            gloss_lens.append(0)
+        if num_chunks < max_chunks:
+            last_pos = {part: item['pose'][part][-1:] for part in body_parts}
+            pad_len = max_chunks - num_chunks
+            pad_values = {
+                part: last_pos[part].repeat(pad_len, 1, 1, 1) for part in body_parts
+            }
+            padded_part_poses = {
+                part: torch.cat([item['pose'][part], pad_values[part]], dim=0)
+                for part in body_parts
+            }  # {str: Tensor}, (max_chunks, window, K, C)
+        else:
+            padded_part_poses = item['pose']
+        stacked_pose, part_lens = _stack_parts(
+            padded_part_poses
+        )  # (max_chunks, window, sum(K_part), C)
+        padded_poses.append(stacked_pose)
+    padded_poses = torch.stack(
+        padded_poses, dim=0
+    )  # (B, max_chunks, window, sum(K_part), C)
+    pose_lens = torch.tensor(pose_lens, dtype=torch.long)  # (B,)
+    gloss_lens = torch.tensor(gloss_lens, dtype=torch.long) if any(gloss_lens) else None
 
     out = {
-        "pose": padded_poses,  # {part: (B, max_T, K, C)}
+        "pose": padded_poses,  # Tensor, (B, N, window, sum(K_part), C)
         "text": text_list,  # List[str]
-        "pose_len": pose_len,  # (B,)
+        "pose_len": pose_lens,  # (B,), 代表每个样本的有效chunk数量
         "gloss": gloss_list,  # List[List[str]] 或 None
-        "gloss_len": gloss_len,  # (B,) 或 None
+        "gloss_len": gloss_lens,  # (B,) 或 None
         "parts": body_parts,  # 便于下游知道顺序
+        "part_lens": part_lens,  # List[int], 对应每个part的关键点数量
         "adjacency_matrix": batch[0]["adjacency_matrix"],  # {str: Tensor}
     }
     return out
@@ -361,27 +434,32 @@ def create_dataloader(
 
 
 if __name__ == "__main__":
-    config = {
-        "data_dir": "/nas/DDDataLang/250916/csl_dental",
-        "augmentations": "speed,mask",
+    test_data_path = Path(__file__).parent / 'test_data' / 'shm_overfit'
+    test_config = {
+        'data_dir': str(test_data_path),
+        'window': 32,
+        'stride': 16,
+        'min_reserved_ratio': 0.6,
+        'pad_last': True,
     }
     transform = NormalizeProcessor()
-    dataset = MyDataset(config, transform, split='train')
+    dataset = MyDataset(test_config, transform=transform, split='train')
     print(f"Dataset length: {len(dataset)}")
     sample = dataset[0]
     dataloader = create_dataloader(
-        config,
+        test_config,
         split='train',
         transform=transform,
-        batch_size=32,
+        batch_size=2,
         shuffle=True,
+        pin_memory=False,
+        num_workers=0,
     )
     for batch in dataloader:
         print("Batch keys:", batch.keys())
         print("Pose parts:", batch['parts'])
         print("Pose shape for each part:")
-        for part in batch['parts']:
-            print(f"  {part}: {batch['pose'][part].shape}")
+        print(batch['pose'].shape)  # (B, N, window, sum(K_part), C)
         print("Text sample:", batch['text'][:2])
         print("Pose lengths:", batch['pose_len'])
         if batch['gloss'] is not None:
