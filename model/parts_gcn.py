@@ -91,6 +91,7 @@ class MultiPartGCNModel(nn.Module):
         self,
         adjacency: Dict[str, torch.Tensor],
         in_channels: int,
+        device: torch.device,
     ) -> None:
         if not adjacency:
             raise ValueError("Adjacency matrices are required to initialise backbones.")
@@ -106,9 +107,9 @@ class MultiPartGCNModel(nn.Module):
         for part in self.parts:
             adj = adjacency[part]
             if not isinstance(adj, torch.Tensor):
-                adj = torch.as_tensor(adj, dtype=torch.float32)
+                adj = torch.as_tensor(adj, dtype=torch.float32, device=device)
             else:
-                adj = adj.detach().to(dtype=torch.float32)
+                adj = adj.detach().to(device=device, dtype=torch.float32)
             backbone = UniGCNPartBackbone(
                 in_channels=in_channels,
                 adjacency=adj,
@@ -117,7 +118,7 @@ class MultiPartGCNModel(nn.Module):
                 adaptive=self.adaptive,
                 temporal_kernel_size=self.temporal_kernel,
                 dropout=self.dropout,
-            )
+            ).to(device)
             self.backbones[part] = backbone
         self._in_channels = in_channels
 
@@ -165,9 +166,9 @@ class MultiPartGCNModel(nn.Module):
                 raise ValueError(
                     "Adjacency matrices must be provided before the first forward call."
                 )
-            self._ensure_backbones(adjacency, channels_used)
+            self._ensure_backbones(adjacency, channels_used, pose.device)
         elif adjacency is not None:
-            self._ensure_backbones(adjacency, channels_used)
+            self._ensure_backbones(adjacency, channels_used, pose.device)
 
         frame_mask_float, frame_mask_bool, chunk_mask = _build_masks(
             pose_len,
