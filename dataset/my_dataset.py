@@ -6,6 +6,7 @@ import json
 import time
 import os
 import pickle
+import random
 
 from .transform import NormalizeProcessor
 from torch.utils.data import Dataset, DataLoader
@@ -37,6 +38,8 @@ class MyDataset(Dataset):
         self._split_dataset()
 
         self.min_reserved_ratio = self.config.get('min_reserved_ratio', 0.6)
+        self._base_seed = int(self.config.get('seed', 3407))
+        self._epoch = 0
         self.pad_last = self.config.get('pad_last', True)
         self.window = self.config.get('window', 32)
         self.stride = self.config.get('stride', 16)
@@ -201,25 +204,27 @@ class MyDataset(Dataset):
         new_data = interpolator(new_time_axis)
         return new_data.astype(data.dtype)
 
-    def mask_augment(self, data: np.ndarray, mask_prob: float) -> np.ndarray:
-        '''
-        随机遮挡部分骨骼数据以进行数据增强。
-
-        :param data: 输入的骨架数据，形状为 (T, 133, 3)。T是时间帧数。
-        :param mask_prob: 遮挡概率，范围在 [0.0, 1.0] 之间。
-        :return: 经过遮挡增强后的新数据，形状为 (T, 133, 3)。
-        '''
+    def mask_augment(
+        self,
+        data: np.ndarray,
+        mask_prob: float,
+        rng: Optional[np.random.Generator] = None,
+    ) -> np.ndarray:
         if not (0.0 <= mask_prob <= 1.0):
             raise ValueError("Mask probability must be in the range [0.0, 1.0].")
         if mask_prob == 0.0:
             return data.copy()
 
+        if rng is None:
+            rng = np.random.default_rng()
+
         new_data = data.copy()
         T, N, C = new_data.shape
         for t in range(T):
             for n in range(N):
-                if np.random.rand() < mask_prob:
-                    new_data[t, n, :] = 0.0
+                if rng.random() < mask_prob:
+                    new_data[t, n, :2] = 0.0
+                    new_data[t, n, 2] = 0.0
         return new_data
 
     def get_pose(self, data_id: str) -> np.ndarray:
@@ -233,6 +238,19 @@ class MyDataset(Dataset):
             raise ValueError("Transform processor is not set.")
         return self.transform.gen_adjacency_matrix(normalize=normalize, split_part=True)
 
+    def set_epoch(self, epoch: int) -> None:
+        """Allow the caller to update the epoch for RNG derivation."""
+        self._epoch = int(epoch)
+
+    def _make_rng(self, idx: int) -> np.random.Generator:
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            base_seed = worker_info.seed
+        else:
+            base_seed = self._base_seed
+        seed = base_seed + self._epoch * 1_000_003 + idx * 97
+        return np.random.default_rng(seed)
+
     def __len__(self):
         return len(self.data_ids)
 
@@ -245,20 +263,22 @@ class MyDataset(Dataset):
         data_id = self.data_ids[idx]
         annotation = self._annotations[data_id]
         sample = {}
+        rng = self._make_rng(idx)
         pose = self.get_pose(data_id)  # (T, K, C)
         T = pose.shape[0]
         augs = self.config.get('augmentations', '')
         prob = self.config.get('aug_prob', 0.5)
-        if np.random.rand() < prob and self.split == 'train':
+        if rng.random() < prob and self.split == 'train':
             if 'speed' in augs:
-                speed_factor = np.random.uniform(
+                speed_factor = rng.uniform(
                     self.config.get('aug_speed_min', 0.9),
                     self.config.get('aug_speed_max', 1.1),
                 )
                 pose = self.speed_augment(pose, speed_factor)
             if 'mask' in augs:
                 mask_prob = self.config.get('aug_mask_prob', 0.05)
-                pose = self.mask_augment(pose, mask_prob)
+                if mask_prob > 0:
+                    pose = self.mask_augment(pose, mask_prob, rng)
 
         t_prime = pose.shape[0]
         if self.pad_last:
@@ -280,7 +300,7 @@ class MyDataset(Dataset):
         min_reserved = max(1, int(chunk_cnt * self.min_reserved_ratio))
         if chunk_cnt < min_reserved:
             chunk_cnt = min_reserved
-        reversed_chunk_cnt = np.random.randint(min_reserved, chunk_cnt + 1)
+        reversed_chunk_cnt = int(rng.integers(min_reserved, chunk_cnt + 1))
         assert 1 <= reversed_chunk_cnt <= chunk_cnt
         reversed_t = (reversed_chunk_cnt - 1) * self.stride + self.window
         if self.split != 'train':
@@ -405,6 +425,15 @@ def my_collate_fn(batch):
     return out
 
 
+def _seed_worker(worker_id: int) -> None:
+    worker_info = torch.utils.data.get_worker_info()
+    if worker_info is None:
+        return
+    seed = worker_info.seed % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
 def create_dataloader(
     config: Dict,
     split: Literal['train', 'val', 'test'],
@@ -417,6 +446,10 @@ def create_dataloader(
 ) -> DataLoader:
     start_time = time.time()
     dataset = MyDataset(config, transform, split=split)
+    base_seed = int(config.get('seed', 3407))
+    split_offset = {'train': 0, 'val': 1, 'test': 2}.get(split, 0)
+    generator = torch.Generator()
+    generator.manual_seed(base_seed + split_offset)
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -424,6 +457,8 @@ def create_dataloader(
         num_workers=num_workers,
         collate_fn=my_collate_fn,
         pin_memory=pin_memory,
+        worker_init_fn=_seed_worker,
+        generator=generator,
     )
     if verbose:
         elapsed = time.time() - start_time

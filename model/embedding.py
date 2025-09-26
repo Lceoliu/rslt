@@ -1,51 +1,58 @@
-from typing import Dict, Any
+from __future__ import annotations
+
+from typing import Any, Dict, Sequence
 
 import numpy as np
 import torch
 
-from .parts_gcn import MultiPartGCNModel, PARTS_DEFAULT
+from .parts_gcn import PARTS_DEFAULT
+from .visual_encoder import VisualEncoder
+
+__all__ = ["build_visual_encoder", "compute_embedding_from_parts"]
 
 
-def build_model_from_config(cfg: Dict[str, Any]) -> MultiPartGCNModel:
+def _ensure_parts(parts: Sequence[str]) -> Sequence[str]:
+    if "fullbody" in parts:
+        return parts
+    ordered = list(parts) + ["fullbody"]
+    deduped: list[str] = []
+    seen = set()
+    for name in ordered:
+        if name not in seen:
+            deduped.append(name)
+            seen.add(name)
+    return deduped
+
+
+def build_visual_encoder(cfg: Dict[str, Any], llm_dim: int) -> VisualEncoder:
     mcfg = cfg.get("model", {})
-    parts = mcfg.get("parts", PARTS_DEFAULT)
-    # Ensure fullbody is included
-    if 'fullbody' not in parts:
-        parts = list(dict.fromkeys(list(parts) + ['fullbody']))
-    backbone = mcfg.get("backbone", "aagcn")
-    part_embed_dim = int(mcfg.get("part_embed_dim", 256))
-    out_embed_dim = int(mcfg.get("embed_dim", 512))
-    drop_conf = bool(mcfg.get("drop_conf", True))
-    fusion = mcfg.get("fusion", "concat_mlp")
-    # Preset length for per-chunk tokens: prefer llm.num_prefix_tokens if available
-    llm_cfg = cfg.get("llm", {})
-    preset_len = int(mcfg.get("preset_len", llm_cfg.get("num_prefix_tokens", 1)))
-
+    parts = _ensure_parts(mcfg.get("parts", PARTS_DEFAULT))
     uni_cfg = mcfg.get("uni_gcn", {})
-    uni_proj_raw = uni_cfg.get("proj_dim")
-    uni_proj_dim = int(uni_proj_raw) if uni_proj_raw is not None else None
-    uni_temporal_kernel = int(uni_cfg.get("temporal_kernel", 5))
-    uni_adaptive = bool(uni_cfg.get("adaptive", True))
-    uni_dropout = float(uni_cfg.get("dropout", 0.0))
+    transformer_cfg = mcfg.get("chunk_transformer", {})
 
-    return MultiPartGCNModel(
+    mlp_raw = transformer_cfg.get("mlp_dim")
+    mlp_dim = int(mlp_raw) if mlp_raw is not None else None
+
+    encoder = VisualEncoder(
         parts=parts,
-        backbone=backbone,
-        part_embed_dim=part_embed_dim,
-        out_embed_dim=out_embed_dim,
-        drop_conf=drop_conf,
-        fusion=fusion,
-        preset_len=preset_len,
-        uni_proj_dim=uni_proj_dim,
-        uni_temporal_kernel=uni_temporal_kernel,
-        uni_adaptive=uni_adaptive,
-        uni_dropout=uni_dropout,
+        drop_conf=bool(mcfg.get("drop_conf", True)),
+        gcn_embed_dim=int(mcfg.get("part_embed_dim", 256)),
+        gcn_proj_dim=int(uni_cfg.get("proj_dim", 64)),
+        gcn_temporal_kernel=int(uni_cfg.get("temporal_kernel", 5)),
+        gcn_adaptive=bool(uni_cfg.get("adaptive", True)),
+        gcn_dropout=float(uni_cfg.get("dropout", 0.0)),
+        tokens_per_chunk=int(mcfg.get("tokens_per_chunk", 4)),
+        llm_dim=int(llm_dim),
+        transformer_layers=int(transformer_cfg.get("layers", 2)),
+        transformer_heads=int(transformer_cfg.get("heads", 4)),
+        transformer_mlp=mlp_dim,
+        transformer_dropout=float(transformer_cfg.get("dropout", 0.1)),
     )
+    return encoder
 
 
 @torch.no_grad()
 def compute_embedding_from_parts(parts: Dict[str, np.ndarray], cfg: Dict[str, Any]) -> np.ndarray:
-    model = build_model_from_config(cfg)
-    model.eval()
-    z = model(parts)  # [1, D]
-    return z.cpu().numpy()
+    raise NotImplementedError(
+        "Legacy embedding API is not supported with the new pipeline."
+    )

@@ -1,302 +1,200 @@
-from typing import Dict, List, Optional
+from __future__ import annotations
 
-import numpy as np
+from typing import Dict, Optional, Sequence, Tuple
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from dataset.transform import NormalizeProcessor
-from .backbones.aagcn_minimal import AAGCNBackbone, build_adjacency_from_numpy
-from .backbones.stgcn_minimal import STGCNBackbone
 from .backbones.uni_gcn_part import UniGCNPartBackbone
-from .fusion import ConcatMLPFusion, AttentionFusion
+
+__all__ = ["MultiPartGCNModel", "PARTS_DEFAULT"]
+
+_DEFAULT_PARTS: Tuple[str, ...] = (
+    "body",
+    "face",
+    "left_hand",
+    "right_hand",
+    "fullbody",
+)
+
+PARTS_DEFAULT: Tuple[str, ...] = _DEFAULT_PARTS
 
 
-PARTS_DEFAULT = ["body", "face", "left_hand", "right_hand", "fullbody"]
+def _slice_pose_by_part(
+    pose: torch.Tensor, part_lens: Sequence[int]
+) -> Sequence[torch.Tensor]:
+    if sum(part_lens) != pose.size(2):
+        raise ValueError(
+            "Sum of part_lens must equal the joint dimension of pose."
+        )
+    return pose.split(tuple(int(l) for l in part_lens), dim=2)
 
 
-def _np_or_torch_to_nctv(
-    x: np.ndarray | torch.Tensor, drop_conf: bool, device: torch.device
-) -> torch.Tensor:
-    """Accept numpy/torch (T,V,C) or (B,T,V,C) -> tensor (B,C_used,T,V) on device."""
-    if isinstance(x, np.ndarray):
-        arr = x
-        if arr.ndim == 3:
-            arr = arr[None, ...]  # (1,T,V,C)
-        assert arr.ndim == 4
-        if drop_conf:
-            arr = arr[..., :2]
-        arr = arr.astype("float32")
-        B, T, V, C = arr.shape
-        arr = np.transpose(arr, (0, 3, 1, 2))  # (B,C,T,V)
-        return torch.from_numpy(arr).to(device)
-    else:
-        ten = x
-        if ten.dim() == 3:
-            ten = ten.unsqueeze(0)
-        assert ten.dim() == 4
-        if drop_conf and ten.size(-1) >= 3:
-            ten = ten[..., :2]
-        B, T, V, C = ten.shape
-        ten = ten.permute(0, 3, 1, 2).contiguous()  # (B,C,T,V)
-        return ten.to(device)
+def _build_masks(
+    pose_len: Optional[torch.Tensor],
+    *,
+    batch: int,
+    num_chunks: int,
+    chunk_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if pose_len is None:
+        return None, None, None
+    if pose_len.dim() != 1 or pose_len.numel() != batch:
+        raise ValueError("pose_len must be 1D with length equal to batch size.")
+    pose_len = pose_len.to(device=device, dtype=torch.long)
+    chunk_ids = torch.arange(num_chunks, device=device)
+    chunk_mask = chunk_ids.unsqueeze(0) < pose_len.unsqueeze(1)  # [B, N]
+    frame_mask_bool = chunk_mask.view(-1, 1).expand(-1, chunk_len)  # [B*N, T]
+    frame_mask = frame_mask_bool.to(dtype)
+    return frame_mask, frame_mask_bool, chunk_mask
 
 
-class ChunkTransformerEncoder(nn.Module):
-    """Lightweight Transformer encoder to map variable-length sequence [B, T, D]
-    to fixed-length tokens [B, P, D_out]. Uses sinusoidal positional encoding and
-    simple linear interpolation to exactly P tokens after contextualization.
+class MultiPartGCNModel(nn.Module):
+    """Encode chunked multi-part poses with Uni-GCN backbones.
+
+    Args:
+        parts: Ordered list of body part names matching the joint layout.
+        drop_conf: Whether to drop the confidence channel before encoding.
+        embed_dim: Output feature dimensionality of each part-specific backbone.
+        proj_dim: Projection dimensionality inside Uni-GCN.
+        temporal_kernel: Temporal kernel size for Uni-GCN blocks.
+        adaptive: Whether Uni-GCN uses adaptive adjacency.
+        dropout: Dropout applied after Uni-GCN projection.
     """
 
     def __init__(
         self,
-        d_in: int,
-        d_out: int,
-        preset_len: int = 1,
-        nhead: int = 4,
-        num_layers: int = 1,
-        dim_feedforward: int | None = None,
-        dropout: float = 0.1,
-    ) -> None:
-        super().__init__()
-        self.preset_len = int(max(1, preset_len))
-        d_model = d_out
-        if dim_feedforward is None:
-            dim_feedforward = max(256, 4 * d_model)
-        self.in_proj = nn.Linear(d_in, d_model) if d_in != d_model else nn.Identity()
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
-
-    @staticmethod
-    def _positional_encoding(
-        B: int, T: int, D: int, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
-        # Sin-cos positional encoding
-        position = torch.arange(T, device=device, dtype=dtype).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, D, 2, device=device, dtype=dtype)
-            * (-np.log(10000.0) / max(1, D))
-        )
-        pe = torch.zeros(T, D, device=device, dtype=dtype)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        return pe.unsqueeze(0).expand(B, -1, -1)  # [B, T, D]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, T, D_in] -> [B, P, D_out]
-        B, T, Din = x.shape
-        x = self.in_proj(x)
-        D = x.size(-1)
-        pe = self._positional_encoding(B, T, D, x.device, x.dtype)
-        x = x + pe
-        y = self.encoder(x)  # [B, T, D]
-        if self.preset_len == T:
-            return y
-        # Downsample/upsample to preset_len via linear interpolation along time
-        yT = y.transpose(1, 2)  # [B, D, T]
-        yT2 = F.interpolate(yT, size=self.preset_len, mode="linear", align_corners=False)
-        out = yT2.transpose(1, 2).contiguous()  # [B, P, D]
-        return out
-
-
-class MultiPartGCNModel(nn.Module):
-
-    def __init__(
-        self,
-        parts: Optional[List[str]] = None,
-        backbone: str = "aagcn",  # or "stgcn"
-        part_embed_dim: int = 256,
-        out_embed_dim: int = 512,
+        *,
+        parts: Optional[Sequence[str]] = None,
         drop_conf: bool = True,
-        fusion: str = "attention",  # "attention" "concat_mlp"
-        preset_len: int = 1,
-        uni_proj_dim: Optional[int] = None,
-        uni_temporal_kernel: int = 5,
-        uni_adaptive: bool = True,
-        uni_dropout: float = 0.0,
+        embed_dim: int = 256,
+        proj_dim: int = 64,
+        temporal_kernel: int = 5,
+        adaptive: bool = True,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.parts = list(parts or PARTS_DEFAULT)
+        self.parts: Tuple[str, ...] = tuple(parts) if parts else _DEFAULT_PARTS
         self.drop_conf = drop_conf
-        self.preset_len = int(max(1, preset_len))
-        self.backbone_name = backbone.lower()
-        self.uni_proj_dim = uni_proj_dim
-        self.uni_temporal_kernel = int(max(1, uni_temporal_kernel))
-        self.uni_adaptive = bool(uni_adaptive)
-        self.uni_dropout = float(uni_dropout)
+        self.embed_dim = embed_dim
+        self.proj_dim = proj_dim
+        self.temporal_kernel = temporal_kernel
+        self.adaptive = adaptive
+        self.dropout = dropout
 
-        # Build per-part adjacency via NormalizeProcessor (static)
-        proc = NormalizeProcessor()
-        A_parts_np = proc.gen_adjacency_matrix(normalize=False, split_part=True)
-
+        self._in_channels: Optional[int] = None
         self.backbones = nn.ModuleDict()
-        in_channels = 2 if drop_conf else 3
-        part_dims: List[int] = []
+
+    def _ensure_backbones(
+        self,
+        adjacency: Dict[str, torch.Tensor],
+        in_channels: int,
+    ) -> None:
+        if not adjacency:
+            raise ValueError("Adjacency matrices are required to initialise backbones.")
+        missing = [part for part in self.parts if part not in adjacency]
+        if missing:
+            raise KeyError(f"Missing adjacency for parts: {missing}")
+        if self._in_channels is not None and self._in_channels != in_channels:
+            raise ValueError(
+                "Cannot change input channel count once backbones are initialised."
+            )
+        if self.backbones:
+            return
         for part in self.parts:
-            if part not in A_parts_np:
-                raise KeyError(f"Adjacency for body part '{part}' not found")
-            A_np = A_parts_np[part]
-            A = build_adjacency_from_numpy(A_np)
-            if self.backbone_name == "stgcn":
-                backbone_module = STGCNBackbone(
-                    in_channels=in_channels,
-                    A=A,
-                    embed_dim=part_embed_dim,
-                )
-            elif self.backbone_name == "uni_gcn":
-                proj_dim = (
-                    int(self.uni_proj_dim)
-                    if self.uni_proj_dim is not None
-                    else max(32, min(part_embed_dim, 128))
-                )
-                backbone_module = UniGCNPartBackbone(
-                    in_channels=in_channels,
-                    adjacency=A,
-                    proj_dim=proj_dim,
-                    embed_dim=part_embed_dim,
-                    adaptive=self.uni_adaptive,
-                    temporal_kernel_size=self.uni_temporal_kernel,
-                    dropout=self.uni_dropout,
-                )
+            adj = adjacency[part]
+            if not isinstance(adj, torch.Tensor):
+                adj = torch.as_tensor(adj, dtype=torch.float32)
             else:
-                backbone_module = AAGCNBackbone(
-                    in_channels=in_channels,
-                    A=A,
-                    embed_dim=part_embed_dim,
-                )
-            self.backbones[part] = backbone_module
-            part_dims.append(part_embed_dim)
-
-        if fusion == "attention":
-            self.fusion = AttentionFusion(
-                part_dims, out_embed_dim, d_model=min(512, part_embed_dim)
+                adj = adj.detach().to(dtype=torch.float32)
+            backbone = UniGCNPartBackbone(
+                in_channels=in_channels,
+                adjacency=adj,
+                proj_dim=self.proj_dim,
+                embed_dim=self.embed_dim,
+                adaptive=self.adaptive,
+                temporal_kernel_size=self.temporal_kernel,
+                dropout=self.dropout,
             )
-        else:
-            self.fusion = ConcatMLPFusion(
-                part_dims, out_embed_dim, hidden_dim=max(512, out_embed_dim)
-            )
-
-        # Chunk-level sequence encoder to fixed number of tokens per chunk
-        self.chunk_encoder = ChunkTransformerEncoder(
-            d_in=out_embed_dim,
-            d_out=out_embed_dim,
-            preset_len=self.preset_len,
-            nhead=8,
-            num_layers=4,
-            dim_feedforward=max(512, 4 * out_embed_dim),
-            dropout=0.1,
-        )
+            self.backbones[part] = backbone
+        self._in_channels = in_channels
 
     def forward(
         self,
-        parts_kpts: Dict[str, np.ndarray | torch.Tensor],
-        pose_len: Optional[torch.Tensor | np.ndarray] = None,
-    ) -> torch.Tensor:
-        device = next(self.parameters()).device
-        feats = []
-        B_ref: Optional[int] = None
-        mask: Optional[torch.Tensor] = None
-        if pose_len is not None:
-            if isinstance(pose_len, np.ndarray):
-                pose_len = torch.from_numpy(pose_len)
-            pose_len = pose_len.to(device)
-        for part in self.parts:
-            k = parts_kpts[part]
-            x = _np_or_torch_to_nctv(k, drop_conf=self.drop_conf, device=device)
-            if B_ref is None:
-                B_ref = x.size(0)
-            else:
-                assert x.size(0) == B_ref, "All parts must share the same batch size"
-            if pose_len is not None:
-                T = x.size(2)
-                m = torch.arange(T, device=device).unsqueeze(0).expand(B_ref, -1)
-                mask = (m < pose_len.view(-1, 1)).to(x.dtype)
-            x = self.backbones[part](x, mask=mask)
-            feats.append(x)
-        z = self.fusion(feats)  # [B, D]
-        return z
+        pose: torch.Tensor,
+        *,
+        part_lens: Sequence[int],
+        pose_len: Optional[torch.Tensor] = None,
+        adjacency: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Run Uni-GCN encoders over chunked poses.
 
-    @torch.no_grad()
-    def _infer_common_T(self, parts_kpts: Dict[str, np.ndarray | torch.Tensor]) -> int:
-        for v in parts_kpts.values():
-            if isinstance(v, np.ndarray):
-                return int(v.shape[1] if v.ndim == 4 else v.shape[0])
-            return int(v.shape[1] if v.dim() == 4 else v.shape[0])
-        return 0
+        Args:
+            pose: Tensor shaped [B, N_chunk, chunk_len, sum_K, C].
+            part_lens: Joint counts per part matching ``self.parts``.
+            pose_len: Optional valid chunk counts per sample ``[B]``.
+            adjacency: Part-wise adjacency matrices used on the first call.
 
-    def encode_chunks(
-        self,
-        parts_kpts: Dict[str, np.ndarray | torch.Tensor],
-        pose_len: Optional[torch.Tensor | np.ndarray],
-        window: int,
-        stride: int,
-        drop_last: bool = True,
-    ) -> torch.Tensor:
-        """Encode sliding-window chunks to a sequence of embeddings.
-
-        Returns: Tensor[B, N_chunks, P, D]
+        Returns:
+            features: Tensor [B*N_chunk, P, chunk_len, D].
+            frame_mask: Optional bool mask [B*N_chunk, chunk_len] for valid frames.
+            chunk_mask: Optional bool mask [B, N_chunk] for valid chunks.
         """
-        device = next(self.parameters()).device
-        if pose_len is not None and isinstance(pose_len, np.ndarray):
-            pose_len = torch.from_numpy(pose_len)
-        if pose_len is not None:
-            pose_len = pose_len.to(device)
 
-        if pose_len is not None:
-            min_len = int(torch.as_tensor(pose_len).min().item())
-        else:
-            min_len = self._infer_common_T(parts_kpts)
+        if pose.dim() != 5:
+            raise ValueError(
+                "pose must have shape [B, N_chunk, chunk_len, sum_K, C]."
+            )
+        if len(part_lens) != len(self.parts):
+            raise ValueError("part_lens length must match the configured parts.")
 
-        if drop_last:
-            if min_len >= window:
-                starts = list(range(0, min_len - window + 1, max(1, stride)))
-            else:
-                starts = [0]
-        else:
-            starts = list(range(0, max(1, min_len), max(1, stride)))
+        batch_size, num_chunks, chunk_len, total_joints, channels = pose.shape
+        if sum(part_lens) != total_joints:
+            raise ValueError("part_lens must sum to the joint dimension of pose.")
 
-        def _slice_time(x: np.ndarray | torch.Tensor, s: int, w: int):
-            if isinstance(x, np.ndarray):
-                if x.ndim == 4:
-                    return x[:, s : s + w]
-                return x[s : s + w]
-            if x.dim() == 4:
-                return x[:, s : s + w]
-            return x[s : s + w]
+        channels_used = channels
+        if self.drop_conf:
+            if channels < 2:
+                raise ValueError("drop_conf=True requires at least two channels.")
+            channels_used = min(2, channels)
 
-        feats_seq: List[torch.Tensor] = []
-        B_ref: Optional[int] = None
-        for s in starts:
-            chunk_feats_seq: List[torch.Tensor] = []
-            chunk_mask: Optional[torch.Tensor] = None
-            for part in self.parts:
-                k_all = parts_kpts[part]
-                k_chunk = _slice_time(k_all, s, window)
-                x = _np_or_torch_to_nctv(
-                    k_chunk, drop_conf=self.drop_conf, device=device
+        if not self.backbones:
+            if adjacency is None:
+                raise ValueError(
+                    "Adjacency matrices must be provided before the first forward call."
                 )
-                if B_ref is None:
-                    B_ref = x.size(0)
-                if pose_len is not None:
-                    t = x.size(2)
-                    m = torch.arange(t, device=device).unsqueeze(0).expand(B_ref, -1)
-                    chunk_mask = (m + s < pose_len.view(-1, 1)).to(x.dtype)
-                y_seq = self.backbones[part](x, mask=chunk_mask, return_seq=True)
-                chunk_feats_seq.append(y_seq)
-            t_prime = min(f.shape[1] for f in chunk_feats_seq)
-            chunk_feats_seq = [f[:, :t_prime] for f in chunk_feats_seq]
-            flat_parts = [f.reshape(-1, f.size(-1)) for f in chunk_feats_seq]
-            z_flat = self.fusion(flat_parts)
-            z_seq = z_flat.view(B_ref, t_prime, -1)
-            z_tok = self.chunk_encoder(z_seq)
-            feats_seq.append(z_tok)
+            self._ensure_backbones(adjacency, channels_used)
+        elif adjacency is not None:
+            self._ensure_backbones(adjacency, channels_used)
 
-        z_seq = torch.stack(feats_seq, dim=1)
-        return z_seq
+        frame_mask_float, frame_mask_bool, chunk_mask = _build_masks(
+            pose_len,
+            batch=batch_size,
+            num_chunks=num_chunks,
+            chunk_len=chunk_len,
+            device=pose.device,
+            dtype=pose.dtype,
+        )
+
+        flat_pose = pose.reshape(
+            batch_size * num_chunks, chunk_len, total_joints, channels
+        )
+        part_poses = _slice_pose_by_part(flat_pose, part_lens)
+
+        outputs = []
+        mask_for_backbone = frame_mask_float
+        for part_name, part_pose in zip(self.parts, part_poses):
+            if self.drop_conf and channels >= 2:
+                part_pose = part_pose[..., :channels_used]
+            x = part_pose.permute(0, 3, 1, 2).contiguous()  # [B*N, C, T, K]
+            feats = self.backbones[part_name](
+                x,
+                mask=mask_for_backbone,
+                return_seq=True,
+            )  # [B*N, T, D]
+            outputs.append(feats)
+
+        features = torch.stack(outputs, dim=1)  # [B*N, P, T, D]
+        return features, frame_mask_bool, chunk_mask

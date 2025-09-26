@@ -40,108 +40,64 @@ except Exception:
     raise RuntimeError("DeepSpeed not installed. Install via: pip install deepspeed")
 
 from model.config import load_config
-from model.embedding import build_model_from_config
-from model.adapter import VisualAdapter
+from model.embedding import build_visual_encoder
 from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
 from training.utils import set_seed
 
 
 class VLLMTrainer(nn.Module):
-    """Composite module: MultiPart embedder + adapter + LLM CE loss.
+    """Couple the visual encoder with the language model for training."""
 
-    Forward returns a scalar CE loss computed by the LLM.
-    """
-
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg: Dict[str, Any]) -> None:
         super().__init__()
         self.cfg = cfg
-        # Build visual embedder
-        self.embedder = build_model_from_config(cfg)
-        embed_dim = int(cfg.get('model', {}).get('embed_dim', 512))
-
-        # Build LLM
         llm_cfg = cfg.get('llm', {})
-        model_name = llm_cfg.get('model_name_or_path', '../Qwen2.5-0.5B')
+        model_name = llm_cfg.get(
+            'model_name_or_path', '../Qwen/Qwen2.5-0.5B'
+        )  # default to Qwen2.5-0.5B
         print(f"Building LLM: {model_name}")
         trust_remote_code = bool(llm_cfg.get('trust_remote_code', True))
-        max_text_len = int(llm_cfg.get('max_text_len', 128))
         gradient_checkpointing = bool(llm_cfg.get('gradient_checkpointing', False))
         freeze_lm = bool(llm_cfg.get('freeze_lm', False))
-        bot_token = llm_cfg.get('bot_token', '<BOT>')
-
+        max_text_len = int(llm_cfg.get('max_text_len', 128))
         self.llm = LLMWithVisualPrefix(
             model_name_or_path=model_name,
             trust_remote_code=trust_remote_code,
             max_text_len=max_text_len,
             gradient_checkpointing=gradient_checkpointing,
             freeze_lm=freeze_lm,
-            bot_token=bot_token,
+            boc_token=llm_cfg.get('boc_token', '<BOC>'),
+            eoc_token=llm_cfg.get('eoc_token', '<EOC>'),
+            bot_token=llm_cfg.get('bot_token', '<BOT>'),
+            eot_token=llm_cfg.get('eot_token', '<EOT>'),
         )
-        llm_dim = self.llm.hidden_size
+        self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
 
-        # Build adapter to project visual embedding to LLM hidden size
-        num_prefix_tokens = int(llm_cfg.get('num_prefix_tokens', 1))
-        hidden_dim = int(llm_cfg.get('adapter_hidden', max(512, embed_dim)))
-        self.adapter = VisualAdapter(
-            in_dim=embed_dim,
-            llm_dim=llm_dim,
-            num_prefix_tokens=num_prefix_tokens,
-            hidden_dim=hidden_dim,
+    def forward(self, batch: Dict[str, Any]) -> torch.Tensor:
+        if not isinstance(batch, dict):
+            raise TypeError('Expected batch dict from dataloader.')
+        pose = batch['pose']
+        part_lens = batch['part_lens']
+        adjacency = batch['adjacency_matrix']
+        texts = batch.get('text')
+        pose_len = batch.get('pose_len')
+        if texts is None:
+            raise ValueError('Batch must include text field.')
+
+        device = next(self.visual.parameters()).device
+        pose = pose.to(device)
+        pose_len = pose_len.to(device) if pose_len is not None else None
+        adjacency = {k: v.to(device) for k, v in adjacency.items()}
+
+        tokens, token_mask, _ = self.visual(
+            pose,
+            part_lens=part_lens,
+            pose_len=pose_len,
+            adjacency=adjacency,
         )
-        # Streaming config (default enabled)
-        s_cfg = cfg.get('streaming', {})
-        self.streaming_enabled = bool(s_cfg.get('enabled', True))
-        self.window = int(s_cfg.get('window', 16))
-        self.stride = int(s_cfg.get('stride', 8))
-        self.drop_last = bool(s_cfg.get('drop_last', True))
-        self.loss_reduction = str(s_cfg.get('loss_reduction', 'mean'))
-        # Random loss skipping for streaming chunks
-        self.skip_loss_prob = float(s_cfg.get('skip_loss_prob', 0.0))
-        self.keep_first = bool(s_cfg.get('keep_first', True))
-        self.always_keep_last = bool(s_cfg.get('always_keep_last', True))
-
-    def forward(self, batch):
-        # Accept my_dataset dict or fallback tuple/list
-        if isinstance(batch, (tuple, list)) and len(batch) >= 1 and not isinstance(batch[0], (dict,)):
-            # Fallback dummy case: (parts, label)
-            parts = batch[0]
-            texts = None
-            pose_len = None
-            print(
-                "Warning: using fallback batch format (parts, label). No text loss will be computed."
-            )
-        elif isinstance(batch, dict):
-            parts = batch['pose']
-            texts = batch.get('text', None)
-            pose_len = batch.get('pose_len', None)
-        else:
-            parts = batch
-            texts = None
-            pose_len = None
-        assert isinstance(parts, dict), f"Expected parts dict, got {type(parts)}"
-        if self.streaming_enabled:
-            # Sliding-window sequence of prefixes
-            z_seq = self.embedder.encode_chunks(
-                parts, pose_len=pose_len, window=self.window, stride=self.stride, drop_last=self.drop_last
-            )  # [B, N, D]
-            prefix_seq = self.adapter(z_seq)  # [B, N, E] (P=1)
-            if texts is None:
-                return 1e-6 * (z_seq ** 2).mean()
-            return self.llm.forward_stream(
-                prefix_seq,
-                texts,
-                reduction=self.loss_reduction,
-                skip_prob=self.skip_loss_prob,
-                keep_first=self.keep_first,
-                always_keep_last=self.always_keep_last,
-            )
-        else:
-            z = self.embedder(parts, pose_len=pose_len)  # [B, D]
-            prefix = self.adapter(z)  # [B, P, E]
-            if texts is None:
-                return 1e-6 * (z ** 2).mean()
-            return self.llm(prefix, texts)
+        loss = self.llm(tokens, token_mask, texts)
+        return loss
 
 
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -226,7 +182,7 @@ def train(args):
             params['warmup_num_steps'] = max(1, int(round(0.05 * total_num_steps)))
         params['total_num_steps'] = total_num_steps
 
-    # Build composite trainer module (embedder + adapter + LLM)
+    # Build composite trainer module (visual encoder + LLM)
     net = VLLMTrainer(cfg)
     print(f"Model built. Total params: {sum(p.numel() for p in net.parameters()):,}")
 
@@ -310,6 +266,12 @@ def train(args):
             start_epoch = 0
 
     for epoch in range(start_epoch, epochs):
+        if hasattr(train_loader, 'sampler') and hasattr(
+            train_loader.sampler, 'set_epoch'
+        ):
+            train_loader.sampler.set_epoch(epoch)
+        if hasattr(train_loader.dataset, 'set_epoch'):
+            train_loader.dataset.set_epoch(epoch)
         engine.train()
         iterable = train_loader
         if engine.global_rank == 0 and tqdm is not None:
@@ -401,90 +363,11 @@ def evaluate(engine, loader: DataLoader) -> float:
 
 @torch.no_grad()
 def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], global_step: int, writer=None) -> None:
-    """Randomly sample 3~5 items from val loader, run streaming inference and log results.
-    Rank0 only. Keeps the engine/module state intact.
-    """
+    """Sampling is disabled for the simplified pipeline."""
     if dist.is_initialized() and dist.get_rank() != 0:
         return
-    module = engine.module  # VLLMTrainer
-    assert hasattr(module, 'embedder') and hasattr(module, 'adapter') and hasattr(module, 'llm')
-    window = getattr(module, 'window', 32)  # Use actual config values
-    stride = getattr(module, 'stride', 16)  # Use actual config values
-    drop_last = getattr(module, 'drop_last', True)
-    nsamples = random.randint(3, 5)
-    # Decoding parameters from config (real inference settings)
-    dec_cfg = cfg.get('decoding', {})
-    max_new_tokens = int(dec_cfg.get('max_new_tokens', 48))
-    do_sample = bool(dec_cfg.get('do_sample', True))  # Consistent with config
-    temperature = float(dec_cfg.get('temperature', 1.0))
-    top_k = int(dec_cfg.get('top_k', 0))
-    collected = 0
-    # Randomly choose starting batch index to avoid always sampling from the beginning
-    start_offset = random.randint(0, 3)
-    for bidx, batch in enumerate(loader):
-        if bidx < start_offset:
-            continue
-        # Extract candidate indices within this batch
-        B = batch['pose_len'].shape[0] if isinstance(batch, dict) and 'pose_len' in batch else None
-        if not B:
-            continue
-        # Move tensors to device
-        device = engine.device
-        parts = {}
-        for k, v in batch['pose'].items():
-            parts[k] = v.to(device)
-        pose_len = batch.get('pose_len', None)
-        if pose_len is not None:
-            pose_len = pose_len.to(device)
-        texts = batch.get('text', None)
-        # Sample one or two indices from this batch
-        take = min(nsamples - collected, min(2, B))
-        indices = random.sample(range(B), k=take)
-        for i in indices:
-            # Single-item dict
-            single_parts = {k: v[i:i+1] for k, v in parts.items()}
-            single_len = pose_len[i:i+1] if pose_len is not None else None
-            single_text = [texts[i]] if texts is not None else [""]
-            # Streaming encode
-            z_seq = module.embedder.encode_chunks(single_parts, single_len, window, stride, drop_last)  # [1, N, D]
-            prefix_seq = module.adapter(z_seq)  # [1, N, E]
-            # Decode at more frequent chunk milestones for better supervision
-            N = prefix_seq.shape[1]
-            step = max(1, N // 10)  # Increased sampling frequency from N//5 to N//10
-            chunk_points = list(range(0, N, step))
-            if (N - 1) not in chunk_points:
-                chunk_points.append(N - 1)
-            # Log header
-            header = f"step {global_step} val, batch_index={bidx}, sample batch id {i}, gt: \"{single_text[0]}\", total chunks: {N}"
-            logging.info(header)
-            tb_lines = [header]
-            # Iterate and generate
-            module.llm.reset_prefix_cache()
-            for ci in range(N):
-                module.llm.step_prefix(prefix_seq[:, ci])
-                if ci in chunk_points:
-                    try:
-                        pred = module.llm.generate_from_prefix(
-                            max_new_tokens=max_new_tokens,
-                            do_sample=do_sample,
-                            temperature=temperature,
-                            top_k=top_k,
-                        )
-                        line = f"  chunk {ci} predict: \"{pred[0]}\""
-                        logging.info(line)
-                        tb_lines.append(line)
-                    except Exception as e:
-                        line = f"  chunk {ci} predict: <generation failed: {e}>"
-                        logging.info(line)
-                        tb_lines.append(line)
-            # Write to TensorBoard as a single text block
-            if writer is not None:
-                writer.add_text('val/sample', "\n".join(tb_lines), global_step)
-            collected += 1
-            if collected >= nsamples:
-                break
-        if collected >= nsamples:
-            break
+    logging.info('sample_and_log_predictions is skipped.')
+    return
 
 
 def main():
