@@ -19,15 +19,18 @@ from functools import lru_cache
 import torch.distributed as dist
 
 class MyDataset(Dataset):
+
     def __init__(
         self,
         config: Dict,
         transform: NormalizeProcessor,
         split: Literal['train', 'val', 'test'] = 'train',
+        verbose: bool = False,
     ):
         self.config = config
         self.transform = transform
         self.split = split
+        self.verbose = verbose
 
         self._memmap_data = None
         self._annotations = None
@@ -301,6 +304,10 @@ class MyDataset(Dataset):
         if chunk_cnt < min_reserved:
             chunk_cnt = min_reserved
         reversed_chunk_cnt = int(rng.integers(min_reserved, chunk_cnt + 1))
+        if self.verbose:
+            print(
+                f"Data ID {data_id}: original frames {T}, after aug {t_prime}, chunks {chunk_cnt}, reserved {reversed_chunk_cnt}."
+            )
         assert 1 <= reversed_chunk_cnt <= chunk_cnt
         reversed_t = (reversed_chunk_cnt - 1) * self.stride + self.window
         if self.split != 'train':
@@ -445,7 +452,7 @@ def create_dataloader(
     verbose: bool = True,
 ) -> DataLoader:
     start_time = time.time()
-    dataset = MyDataset(config, transform, split=split)
+    dataset = MyDataset(config, transform, split=split, verbose=verbose)
     base_seed = int(config.get('seed', 3407))
     split_offset = {'train': 0, 'val': 1, 'test': 2}.get(split, 0)
     generator = torch.Generator()

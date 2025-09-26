@@ -68,14 +68,24 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, int]
 
         transform = NormalizeProcessor(conf_threshold=cfg.get('data', {}).get('conf_threshold', 0.1))
         train_loader = create_dataloader(
-            ds_cfg, split='train', transform=transform,
-            batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=True, verbose=True,
+            ds_cfg,
+            split='train',
+            transform=transform,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            verbose=False,
         )
         val_loader = create_dataloader(
-            ds_cfg, split='val', transform=transform,
-            batch_size=batch_size, shuffle=False,
-            num_workers=num_workers, pin_memory=True, verbose=True,
+            ds_cfg,
+            split='val',
+            transform=transform,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            verbose=False,
         )
         return train_loader, val_loader, nclass
 

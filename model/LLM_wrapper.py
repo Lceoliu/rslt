@@ -4,6 +4,7 @@ from typing import Dict, List, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import pdb
 
 
 class LLMWithVisualPrefix(nn.Module):
@@ -21,6 +22,7 @@ class LLMWithVisualPrefix(nn.Module):
         eoc_token: str = "<EOC>",
         bot_token: str = "<BOT>",
         eot_token: str = "<EOT>",
+        verbose: bool = False,
     ) -> None:
         super().__init__()
         try:
@@ -34,9 +36,10 @@ class LLMWithVisualPrefix(nn.Module):
             model_name_or_path,
             trust_remote_code=trust_remote_code,
         )
+        original_tokenizer_size = len(self.tokenizer)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-
+        self.verbose = verbose
         self.special_tokens = {
             "boc": boc_token,
             "eoc": eoc_token,
@@ -52,6 +55,10 @@ class LLMWithVisualPrefix(nn.Module):
             trust_remote_code=trust_remote_code,
         )
         self.model.resize_token_embeddings(len(self.tokenizer))
+        if self.verbose:
+            print(
+                f"Loaded LLM: {model_name_or_path}, tokenizer size {original_tokenizer_size} -> {len(self.tokenizer)}"
+            )
         if gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
         if freeze_lm:
@@ -81,7 +88,7 @@ class LLMWithVisualPrefix(nn.Module):
         chunk_tokens: torch.Tensor,
         token_mask: torch.Tensor,
         texts: Sequence[str],
-    ) -> torch.Tensor:
+    ):
         """Compute autoregressive loss given chunk embeddings and texts."""
 
         if chunk_tokens.dim() != 4:
@@ -90,6 +97,9 @@ class LLMWithVisualPrefix(nn.Module):
             raise ValueError("token_mask must match chunk_tokens batch/length dims.")
         if len(texts) != chunk_tokens.size(0):
             raise ValueError("texts length must equal batch size.")
+
+        if self.verbose:
+            print(f"Texts: {texts}")
 
         model_dtype = self.model.get_input_embeddings().weight.dtype
         chunk_tokens = chunk_tokens.to(model_dtype)
@@ -101,6 +111,7 @@ class LLMWithVisualPrefix(nn.Module):
         seq_embeds: List[torch.Tensor] = []
         seq_labels: List[torch.Tensor] = []
         for chunk_embed, mask, text in zip(chunk_tokens, token_mask, texts):
+            # chunk_embed: [N, P, E], mask: [N, P], N为chunk数量，P为Token_Per_chunk数量，E为embedding维度
             prefix_embeds, prefix_ids = self._build_prefix(
                 chunk_embed,
                 mask,
@@ -125,12 +136,13 @@ class LLMWithVisualPrefix(nn.Module):
             seq_labels.append(labels)
 
         inputs_embeds, attention_mask, labels = self._pad_sequences(seq_embeds, seq_labels)
+        # pdb.set_trace()
         outputs = self.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             labels=labels,
         )
-        return outputs.loss
+        return outputs
 
     @torch.no_grad()
     def generate(
@@ -139,9 +151,9 @@ class LLMWithVisualPrefix(nn.Module):
         token_mask: torch.Tensor,
         *,
         max_new_tokens: int = 64,
-        do_sample: bool = False,
+        do_sample: bool = True,
         temperature: float = 1.0,
-        top_k: int = 0,
+        top_k: int = 10,
     ) -> List[str]:
         if chunk_tokens.dim() != 4:
             raise ValueError("chunk_tokens must be [B, N, P, E].")
@@ -166,14 +178,18 @@ class LLMWithVisualPrefix(nn.Module):
             )
             prefix_embeds_list.append(prefix_embeds)
             prefix_id_list.append(prefix_ids)
+        if self.verbose:
+            print(f"prefix ids: {prefix_id_list}")
 
         inputs_embeds, attention_mask, lengths = self._pad_prefixes(prefix_embeds_list)
         input_ids = self._pad_prefix_token_ids(prefix_id_list, lengths)
+        if self.verbose:
+            print(f"Input ids: {input_ids.tolist()}")
 
         sequences = self.model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            input_ids=input_ids,
+            # input_ids=input_ids,
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             temperature=temperature,
@@ -184,7 +200,7 @@ class LLMWithVisualPrefix(nn.Module):
 
         results: List[str] = []
         for seq, prefix_len in zip(sequences, lengths.tolist()):
-            gen_tokens = seq[prefix_len:]
+            gen_tokens = seq[:]
             eot_id = self._special_ids["eot"]
             if (gen_tokens == eot_id).any():
                 stop = torch.nonzero(gen_tokens == eot_id, as_tuple=False)[0].item()
@@ -200,9 +216,17 @@ class LLMWithVisualPrefix(nn.Module):
         embed_layer: nn.Embedding,
         special_embeds: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        chunk_embed: [N, P, E]
+        mask: [N, P] bool
+        Returns:
+            prefix: [L, E], 包含 <BOC> chunk1 <EOC> <BOC> chunk2 <EOC> ... <BOT>
+            prefix_ids: [L] (-1 for non-token positions)
+        """
         parts: List[torch.Tensor] = []
         token_ids: List[int] = []
         for chunk_vecs, chunk_mask in zip(chunk_embed, mask):
+            # chunk_vecs: [P, E], chunk_mask: [P]
             valid_idx = torch.nonzero(chunk_mask, as_tuple=False).squeeze(-1)
             if valid_idx.numel() == 0:
                 continue
@@ -228,6 +252,12 @@ class LLMWithVisualPrefix(nn.Module):
         self,
         embeds: Sequence[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Input: embeds: List of [L_i, E] tensors
+        Output: padded_embeds: [B, L_max, E]
+                attention_mask: [B, L_max] (1 for valid, 0 for padding)
+                lengths: [B] lengths of each sequence
+        """
         max_len = max(seq.size(0) for seq in embeds)
         batch = len(embeds)
         device = embeds[0].device
@@ -239,7 +269,7 @@ class LLMWithVisualPrefix(nn.Module):
             self.hidden_size,
             dtype=dtype,
             device=device,
-        )
+        )  # [B, L_max, E]
         attention = torch.zeros(batch, max_len, dtype=torch.long, device=device)
         lengths = torch.zeros(batch, dtype=torch.long, device=device)
         for idx, seq in enumerate(embeds):

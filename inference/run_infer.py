@@ -24,6 +24,7 @@ def _build_test_loader(cfg: Dict[str, Any], split: str = "test") -> Any:
 
     data_cfg = cfg.get("dataset", {})
     assert data_cfg and data_cfg.get("data_dir"), "dataset.data_dir must be provided in config."
+    data_cfg['min_reserved_ratio'] = 1.0
     conf_threshold = cfg.get("data", {}).get("conf_threshold", 0.1)
     transform = NormalizeProcessor(conf_threshold=conf_threshold)
     loader = create_dataloader(
@@ -107,7 +108,7 @@ def main() -> None:
     max_new_tokens = int(args.max_new_tokens) if args.max_new_tokens is not None else int(dec_cfg.get("max_new_tokens", 48))
     do_sample = bool(args.do_sample or dec_cfg.get("do_sample", False))
 
-    net = VLLMTrainer(cfg)
+    net = VLLMTrainer(cfg, verbose=True)
     net = cast_model(net, get_cast_type(ds_config))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net.to(device)

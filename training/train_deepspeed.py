@@ -45,11 +45,12 @@ from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
 from training.utils import set_seed
 
+import pdb
 
 class VLLMTrainer(nn.Module):
     """Couple the visual encoder with the language model for training."""
 
-    def __init__(self, cfg: Dict[str, Any]) -> None:
+    def __init__(self, cfg: Dict[str, Any], verbose: bool = False) -> None:
         super().__init__()
         self.cfg = cfg
         llm_cfg = cfg.get('llm', {})
@@ -71,11 +72,13 @@ class VLLMTrainer(nn.Module):
             eoc_token=llm_cfg.get('eoc_token', '<EOC>'),
             bot_token=llm_cfg.get('bot_token', '<BOT>'),
             eot_token=llm_cfg.get('eot_token', '<EOT>'),
+            verbose=verbose,
         )
         self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
         print(f"LLM hidden size: {self.llm.hidden_size}")
+        self.current_epoch = 0
 
-    def forward(self, batch: Dict[str, Any]) -> torch.Tensor:
+    def forward(self, batch: Dict[str, Any]):
         if not isinstance(batch, dict):
             raise TypeError('Expected batch dict from dataloader.')
         pose = batch['pose']
@@ -97,8 +100,21 @@ class VLLMTrainer(nn.Module):
             pose_len=pose_len,
             adjacency=adjacency,
         )
-        loss = self.llm(tokens, token_mask, texts)
-        return loss
+        output = self.llm(tokens, token_mask, texts)
+        if self.current_epoch % 50 == 0:
+            # pdb.set_trace()
+            res = self.llm.generate(
+                tokens,
+                token_mask,
+                max_new_tokens=64,
+                do_sample=True,
+                temperature=1.0,
+                top_k=1,
+            )
+            print(f"Sample generation at step {self.current_epoch}: {res}")
+
+        loss = output.loss if hasattr(output, 'loss') else output
+        return loss, output
 
 
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -289,10 +305,13 @@ def train(args):
             elif isinstance(batch, (tuple, list)):
                 batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
             with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
-                loss = engine(batch)  # scalar CE loss from LLM
+                loss, output_info = engine(batch)  # scalar CE loss from LLM
+            # pdb.set_trace()
             engine.backward(loss)
             engine.step()
             global_step += 1
+            if hasattr(engine.module, 'current_epoch'):
+                engine.module.current_epoch = global_step
             if writer is not None:
                 writer.add_scalar('train/loss', float(loss.item()), global_step)
                 # Try to log LR
