@@ -73,6 +73,10 @@ class ChunkTokenEncoder(nn.Module):
             if frame_mask.shape != x.shape[:2]:
                 raise ValueError("frame_mask shape must match the batch/time dims of x.")
             key_padding_mask = ~frame_mask.bool()
+        target_dtype = getattr(self.in_proj, "weight", None).dtype if isinstance(self.in_proj, nn.Linear) else x.dtype
+        if target_dtype is None:
+            target_dtype = x.dtype
+        x = x.to(dtype=target_dtype)
         h = self.in_proj(x)
         h = self.encoder(h, src_key_padding_mask=key_padding_mask)
         if self.num_tokens != h.size(1):
