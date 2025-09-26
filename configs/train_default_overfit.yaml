@@ -8,7 +8,7 @@ train:
   resume_from: ""
 
 dataset:
-  data_dir: /2023234331/data/shm/format_data/csl_shm
+  data_dir: /workspace/shm_overfit
   seed: 3407
   augmentations: ""
   aug_prob: 0.0

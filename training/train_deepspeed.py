@@ -73,6 +73,7 @@ class VLLMTrainer(nn.Module):
             eot_token=llm_cfg.get('eot_token', '<EOT>'),
         )
         self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
+        print(f"LLM hidden size: {self.llm.hidden_size}")
 
     def forward(self, batch: Dict[str, Any]) -> torch.Tensor:
         if not isinstance(batch, dict):
@@ -192,6 +193,11 @@ def train(args):
     engine, optimizer, _, scheduler = deepspeed.initialize(
         args=args, model=net, model_parameters=net.parameters()
     )
+    device = engine.device
+    print(
+        f"DeepSpeed engine initialized. Local rank: {engine.local_rank}, Global rank: {engine.global_rank}"
+    )
+    net.to(device)
 
     # Resolve run/ckpt directories (support resume) with consistent RUN_ID across ranks
     train_cfg = cfg.get('train', {})
