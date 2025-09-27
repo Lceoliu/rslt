@@ -4,6 +4,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import pdb
 
 from .chunk_transformer import ChunkTokenEncoder
 from .parts_gcn import MultiPartGCNModel
@@ -105,6 +106,10 @@ class VisualEncoder(nn.Module):
         """
 
         batch_size, num_chunks, chunk_len, total_joints, channels = pose.shape
+        # pdb.set_trace()
+        # features: [B*N_chunk, Parts, chunk_len, gcn_embed_dim]
+        # frame_mask: [B*N_chunk, chunk_len]， 代表每一帧是否有效
+        # chunk_mask: [B, N_chunk]， 代表每一个chunk是否有效
         features, frame_mask, chunk_mask = self.multipart(
             pose,
             part_lens=part_lens,
@@ -113,8 +118,10 @@ class VisualEncoder(nn.Module):
         )
         bn, part_count, _, embed_dim = _reshape_features(features)
         seq = features.permute(0, 2, 1, 3).reshape(bn, chunk_len, part_count * embed_dim)
+        # [B*N_chunk, tokens_per_chunk, llm_dim]
         tokens = self.transformer(seq, frame_mask=frame_mask)
         tokens = tokens.view(batch_size, num_chunks, self.tokens_per_chunk, self.llm_dim)
+        # [B, N_chunk, tokens_per_chunk]
         token_mask = _expand_chunk_mask(
             chunk_mask,
             batch=batch_size,

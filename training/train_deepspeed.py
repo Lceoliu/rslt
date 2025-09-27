@@ -100,7 +100,7 @@ class VLLMTrainer(nn.Module):
             pose_len=pose_len,
             adjacency=adjacency,
         )
-        output = self.llm(tokens, token_mask, texts)
+
         if self.current_epoch % 50 == 0:
             # pdb.set_trace()
             res = self.llm.generate(
@@ -109,9 +109,10 @@ class VLLMTrainer(nn.Module):
                 max_new_tokens=64,
                 do_sample=True,
                 temperature=1.0,
-                top_k=1,
+                top_k=10,
             )
             print(f"Sample generation at step {self.current_epoch}: {res}")
+        output = self.llm(tokens, token_mask, texts)
 
         loss = output.loss if hasattr(output, 'loss') else output
         return loss, output

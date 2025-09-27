@@ -21,7 +21,7 @@ dataset:
   stride: 16
 
 data:
-  batch_size: 1
+  batch_size: 2
   num_workers: 0
   conf_threshold: 0.1
   T: 32

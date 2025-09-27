@@ -118,6 +118,7 @@ class LLMWithVisualPrefix(nn.Module):
                 embed_layer,
                 special_embeds,
             )
+            # pdb.set_trace()
             text_ids = self._tokenize_text(text)
             text_embeds = embed_layer(text_ids.unsqueeze(0)).squeeze(0)
             eot_embed = special_embeds["eot"]
@@ -163,6 +164,7 @@ class LLMWithVisualPrefix(nn.Module):
         model_dtype = self.model.get_input_embeddings().weight.dtype
         chunk_tokens = chunk_tokens.to(model_dtype)
         token_mask = token_mask.to(torch.bool)
+        pdb.set_trace()
 
         special_embeds = self._get_special_embeddings(device=chunk_tokens.device)
         embed_layer = self.model.get_input_embeddings()
