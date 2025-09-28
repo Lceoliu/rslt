@@ -246,9 +246,12 @@ class LLMWithVisualPrefix(nn.Module):
         return prefix, token_ids_tensor
 
     def _prefix_labels_from_ids(self, prefix_ids: torch.Tensor) -> torch.Tensor:
-        labels = prefix_ids.clone()
-        labels[labels == -1] = -100
-        return labels
+        # labels = prefix_ids.clone()
+        # labels[labels == -1] = -100
+        # return labels
+        # Ignore all prefix tokens by setting their labels to -100.
+        # The model should only be trained to predict the text tokens.
+        return torch.full_like(prefix_ids, -100)
 
     def _pad_prefixes(
         self,

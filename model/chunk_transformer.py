@@ -48,6 +48,7 @@ class ChunkTokenEncoder(nn.Module):
             batch_first=True,
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.pool = nn.AdaptiveAvgPool1d(num_tokens)
 
     def forward(
         self,
@@ -79,15 +80,16 @@ class ChunkTokenEncoder(nn.Module):
         x = x.to(dtype=target_dtype)
         h = self.in_proj(x)
         h = self.encoder(h, src_key_padding_mask=key_padding_mask)
-        if self.num_tokens != h.size(1):
-            h = h.transpose(1, 2)
-            h = F.interpolate(
-                h,
-                size=self.num_tokens,
-                mode="linear",
-                align_corners=False,
-            )
-            h = h.transpose(1, 2)
+
+        # Use adaptive average pooling for a better-learned compression
+        # from T vectors to num_tokens vectors.
+        # h shape: [B, T, D] -> [B, D, T] for pooling
+        h = h.transpose(1, 2)
+        # h shape: [B, D, T] -> [B, D, num_tokens]
+        h = self.pool(h)
+        # h shape: [B, D, num_tokens] -> [B, num_tokens, D]
+        h = h.transpose(1, 2)
+
         if frame_mask is not None:
             chunk_alive = frame_mask.any(dim=1, keepdim=True).to(h.dtype)
             h = h * chunk_alive.unsqueeze(-1)
