@@ -164,7 +164,7 @@ class LLMWithVisualPrefix(nn.Module):
         model_dtype = self.model.get_input_embeddings().weight.dtype
         chunk_tokens = chunk_tokens.to(model_dtype)
         token_mask = token_mask.to(torch.bool)
-        pdb.set_trace()
+        # pdb.set_trace()
 
         special_embeds = self._get_special_embeddings(device=chunk_tokens.device)
         embed_layer = self.model.get_input_embeddings()

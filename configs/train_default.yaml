@@ -2,9 +2,9 @@ train:
   seed: 3407
   epochs: 20
   log_interval: 10
-  val_interval: 200
+  val_interval: 250
   save_dir_root: runs
-  save_every: 400
+  save_every: 500
   resume_from: ""
 
 dataset:
@@ -21,7 +21,7 @@ dataset:
   stride: 16
 
 data:
-  batch_size: 4
+  batch_size: 8
   num_workers: 4
   conf_threshold: 0.1
   T: 32
@@ -34,7 +34,7 @@ model:
   part_embed_dim: 256
   tokens_per_chunk: 4
   uni_gcn:
-    proj_dim: 64
+    proj_dim: 256
     temporal_kernel: 5
     adaptive: true
     dropout: 0.0

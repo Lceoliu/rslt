@@ -101,21 +101,21 @@ class VLLMTrainer(nn.Module):
             adjacency=adjacency,
         )
 
-        if self.current_epoch % 50 == 0:
-            # pdb.set_trace()
-            res = self.llm.generate(
-                tokens,
-                token_mask,
-                max_new_tokens=64,
-                do_sample=True,
-                temperature=1.0,
-                top_k=10,
-            )
-            print(f"Sample generation at step {self.current_epoch}: {res}")
+        # if self.current_epoch % 50 == 0 and self.current_epoch > 0:
+        #     # pdb.set_trace()
+        #     res = self.llm.generate(
+        #         tokens,
+        #         token_mask,
+        #         max_new_tokens=64,
+        #         do_sample=True,
+        #         temperature=1.0,
+        #         top_k=10,
+        #     )
+        #     print(f"Sample generation at step {self.current_epoch}: {res}")
         output = self.llm(tokens, token_mask, texts)
 
         loss = output.loss if hasattr(output, 'loss') else output
-        return loss, output
+        return loss
 
 
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -306,7 +306,7 @@ def train(args):
             elif isinstance(batch, (tuple, list)):
                 batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
             with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
-                loss, output_info = engine(batch)  # scalar CE loss from LLM
+                loss = engine(batch)  # scalar CE loss from LLM
             # pdb.set_trace()
             engine.backward(loss)
             engine.step()
@@ -388,12 +388,71 @@ def evaluate(engine, loader: DataLoader) -> float:
 
 
 @torch.no_grad()
-def sample_and_log_predictions(engine, loader: DataLoader, cfg: Dict[str, Any], global_step: int, writer=None) -> None:
-    """Sampling is disabled for the simplified pipeline."""
+def sample_and_log_predictions(
+    engine, loader: DataLoader, cfg: Dict[str, Any], global_step: int, writer=None
+) -> None:
     if dist.is_initialized() and dist.get_rank() != 0:
         return
-    logging.info('sample_and_log_predictions is skipped.')
-    return
+    loader_len = len(loader)
+    # randomly pick 5 indices
+    sample_indices = random.sample(range(loader_len), min(5, loader_len))
+    samples = []
+    for idx, batch in enumerate(loader):
+        if idx not in sample_indices:
+            continue
+        # move tensors to device
+        if isinstance(batch, dict):
+            batch = {
+                k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v)
+                for k, v in batch.items()
+            }
+        elif isinstance(batch, (tuple, list)):
+            batch = [
+                b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b
+                for b in batch
+            ]
+        pose = batch['pose']
+        part_lens = batch['part_lens']
+        adjacency = batch['adjacency_matrix']
+        texts = batch.get('text')
+        pose_len = batch.get('pose_len')
+        if texts is None:
+            continue
+        device = next(engine.module.visual.parameters()).device
+        pose = pose.to(device)
+        pose_len = pose_len.to(device) if pose_len is not None else None
+        adjacency = {k: v.to(device) for k, v in adjacency.items()}
+        tokens, token_mask, _ = engine.module.visual(
+            pose,
+            part_lens=part_lens,
+            pose_len=pose_len,
+            adjacency=adjacency,
+        )
+        res = engine.module.llm.generate(
+            tokens,
+            token_mask,
+            max_new_tokens=64,
+            do_sample=True,
+            temperature=1.0,
+            top_k=10,
+        )
+        for i in range(len(texts)):
+            pred = res[i]
+            gt = texts[i]
+            samples.append((gt, pred))
+    if not samples:
+        return
+    log_lines = [f"=== Sample predictions at step {global_step} ==="]
+    for i, (gt, pred) in enumerate(samples):
+        log_lines.append(f"[Sample {i}]")
+        log_lines.append(f"GT: {gt}")
+        log_lines.append(f"PR: {pred}")
+        log_lines.append("")
+    log_text = "\n".join(log_lines)
+    # print(log_text)
+    logging.info(log_text)
+    if writer is not None:
+        writer.add_text('val/samples', log_text, global_step)
 
 
 def main():

@@ -49,6 +49,7 @@ def predict_for_sample(
     do_sample: bool,
     temperature: float,
     top_k: int,
+    gt_text: str = None,
 ) -> Dict[str, Any]:
     device = next(module.parameters()).device
     pose = batch["pose"].to(device)
@@ -64,6 +65,15 @@ def predict_for_sample(
         pose_len=pose_len,
         adjacency=adjacency,
     )
+    loss = 0.0
+    if gt_text is not None:
+        output = module.llm(
+            tokens,
+            token_mask,
+            [gt_text],
+        )
+        if hasattr(output, 'loss'):
+            loss = output.loss
     predictions = module.llm.generate(
         tokens,
         token_mask,
@@ -76,6 +86,7 @@ def predict_for_sample(
     return {
         "prediction": predictions[0],
         "ground_truth": gt_text,
+        "loss": float(loss) if loss else None,
     }
 
 
@@ -139,6 +150,7 @@ def main() -> None:
     loader = _build_test_loader(cfg, split=args.split)
     results: Dict[str, Any] = {}
     for idx, batch in enumerate(loader):
+        gt_text = batch.get("text", [None])[0]
         result = predict_for_sample(
             net,
             batch,
@@ -146,6 +158,7 @@ def main() -> None:
             do_sample=do_sample,
             temperature=temperature,
             top_k=top_k,
+            gt_text=gt_text,
         )
         key = f"{args.split}_batch{idx}"
         results[key] = result
