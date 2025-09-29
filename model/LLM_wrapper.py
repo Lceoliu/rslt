@@ -38,6 +38,7 @@ class LLMWithVisualPrefix(nn.Module):
         )
         original_tokenizer_size = len(self.tokenizer)
         if self.tokenizer.pad_token_id is None:
+            print("Using eos token as padding token!")
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.verbose = verbose
         self.special_tokens = {
@@ -184,20 +185,17 @@ class LLMWithVisualPrefix(nn.Module):
             print(f"prefix ids: {prefix_id_list}")
 
         inputs_embeds, attention_mask, lengths = self._pad_prefixes(prefix_embeds_list)
-        input_ids = self._pad_prefix_token_ids(prefix_id_list, lengths)
-        if self.verbose:
-            print(f"Input ids: {input_ids.tolist()}")
 
         sequences = self.model.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            # input_ids=input_ids,
             max_new_tokens=max_new_tokens,
             do_sample=do_sample,
             temperature=temperature,
             top_k=top_k,
             eos_token_id=self._special_ids["eot"],
             pad_token_id=self.tokenizer.pad_token_id,
+            repetition_penalty=1.5,
         )
 
         results: List[str] = []
@@ -258,7 +256,10 @@ class LLMWithVisualPrefix(nn.Module):
         embeds: Sequence[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
+        把不同长度的embeddings转化到右padding的形式
+
         Input: embeds: List of [L_i, E] tensors
+
         Output: padded_embeds: [B, L_max, E]
                 attention_mask: [B, L_max] (1 for valid, 0 for padding)
                 lengths: [B] lengths of each sequence

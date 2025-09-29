@@ -4,7 +4,7 @@ train:
   log_interval: 10
   val_interval: 250
   save_dir_root: runs
-  save_every: 500
+  save_every: 1000
   resume_from: ""
 
 dataset:
@@ -16,7 +16,7 @@ dataset:
   aug_speed_max: 1.1
   aug_mask_prob: 0.05
   pad_last: true
-  min_reserved_ratio: 0.6
+  min_reserved_ratio: 1.0
   window: 32
   stride: 16
 
@@ -32,15 +32,15 @@ model:
   parts: ["body", "face", "left_hand", "right_hand", "fullbody"]
   drop_conf: true
   part_embed_dim: 256
-  tokens_per_chunk: 4
+  tokens_per_chunk: 10
   uni_gcn:
     proj_dim: 256
     temporal_kernel: 5
     adaptive: true
     dropout: 0.0
   chunk_transformer:
-    layers: 2
-    heads: 4
+    layers: 3
+    heads: 8
     dropout: 0.1
     mlp_dim: 512
 
@@ -56,9 +56,9 @@ llm:
   eot_token: "<EOT>"
 
 decoding:
-  max_new_tokens: 48
+  max_new_tokens: 64
   do_sample: true
-  temperature: 1.0
-  top_k: 0
+  temperature: 0.3
+  top_k: 10
 
 nclass: 10
