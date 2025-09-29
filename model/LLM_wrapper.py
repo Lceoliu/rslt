@@ -144,7 +144,7 @@ class LLMWithVisualPrefix(nn.Module):
             attention_mask=attention_mask,
             labels=labels,
         )
-        return outputs
+        return outputs, labels
 
     @torch.no_grad()
     def generate(

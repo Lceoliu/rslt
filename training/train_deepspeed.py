@@ -22,6 +22,7 @@ sys.path.append(Path(__file__).parent.parent.as_posix())
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.distributed import ReduceOp
@@ -77,6 +78,9 @@ class VLLMTrainer(nn.Module):
         self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
         print(f"LLM hidden size: {self.llm.hidden_size}")
         self.current_epoch = 0
+        # For visualization
+        self.last_logits = None
+        self.last_labels = None
 
     def forward(self, batch: Dict[str, Any]):
         if not isinstance(batch, dict):
@@ -101,18 +105,12 @@ class VLLMTrainer(nn.Module):
             adjacency=adjacency,
         )
 
-        # if self.current_epoch % 50 == 0 and self.current_epoch > 0:
-        #     # pdb.set_trace()
-        #     res = self.llm.generate(
-        #         tokens,
-        #         token_mask,
-        #         max_new_tokens=64,
-        #         do_sample=True,
-        #         temperature=1.0,
-        #         top_k=10,
-        #     )
-        #     print(f"Sample generation at step {self.current_epoch}: {res}")
-        output = self.llm(tokens, token_mask, texts)
+        # The llm.forward now returns (outputs, labels)
+        output, labels = self.llm(tokens, token_mask, texts)
+
+        # Store for visualization
+        self.last_logits = output.logits
+        self.last_labels = labels
 
         loss = output.loss if hasattr(output, 'loss') else output
         return loss
@@ -324,17 +322,65 @@ def train(args):
                 except Exception:
                     pass
             if engine.global_rank == 0 and (global_step % log_interval == 0):
-                # Add more detailed logging
                 loss_val = loss.item()
                 if tqdm is None:
                     print(f"epoch={epoch} step={global_step} loss={loss_val:.6f}")
-                    # Log abnormal loss values
-                    if loss_val > 20 or loss_val < 0:
-                        print(f"WARNING: Abnormal loss value: {loss_val}")
                 else:
                     iterable.set_postfix({"loss": f"{loss_val:.6f}"})
-                    if loss_val > 20 or loss_val < 0:
-                        print(f"WARNING: Abnormal loss value: {loss_val}")
+
+                # Log abnormal loss values
+                if loss_val > 20 or loss_val < 0:
+                    print(f"WARNING: Abnormal loss value: {loss_val}")
+
+                # Logits visualization
+                try:
+                    logits = engine.module.last_logits
+                    labels = engine.module.last_labels
+                    if logits is not None and labels is not None:
+                        # Get the first sample in the batch
+                        sample_logits = logits[0]
+                        sample_labels = labels[0]
+
+                        # Get probabilities
+                        probs = F.softmax(sample_logits, dim=-1)
+                        
+                        # Get predicted token IDs
+                        predicted_ids = torch.argmax(probs, dim=-1)
+
+                        # Find where the actual text labels start (ignore -100)
+                        text_start_idx = (sample_labels != -100).nonzero(as_tuple=True)[0]
+                        if text_start_idx.numel() > 0:
+                            start = text_start_idx[0]
+                            
+                            # Get tokenizer from the model
+                            tokenizer = engine.module.llm.tokenizer
+
+                            log_lines = ["\n--- Logits Visualization ---"]
+                            log_lines.append(f"Sample: '{batch['text'][0]}'")
+                            log_lines.append("Pos |    GT Token    |   Pred Token   |  GT Prob  | Correct?")
+                            log_lines.append("-----------------------------------------------------------------")
+
+                            # Visualize up to 15 tokens
+                            for i in range(start, min(start + 15, len(sample_labels))):
+                                gt_id = sample_labels[i].item()
+                                if gt_id == -100: continue
+                                
+                                pred_id = predicted_ids[i].item()
+                                gt_prob = probs[i, gt_id].item()
+                                
+                                gt_token = tokenizer.decode([gt_id])
+                                pred_token = tokenizer.decode([pred_id])
+                                
+                                is_correct = "✅" if pred_id == gt_id else "❌"
+                                
+                                log_lines.append(f"{i:<3} | {gt_token:>14} | {pred_token:>14} | {gt_prob:^9.2%} | {is_correct}")
+                            
+                            log_lines.append("--- End Visualization ---\n")
+                            print("\n".join(log_lines))
+
+                except Exception as e:
+                    print(f"[WARN] Failed to visualize logits: {e}")
+
             # Periodic checkpointing on all ranks
             if save_every > 0 and (global_step % save_every == 0):
                 engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epoch})
@@ -373,7 +419,7 @@ def evaluate(engine, loader: DataLoader) -> float:
             batch = {k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
         elif isinstance(batch, (tuple, list)):
             batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
-        loss = engine(batch)
+        loss, _, _ = engine(batch)
         local_sum += float(loss.item())
         local_count += 1
     # Aggregate across ranks to avoid desync
