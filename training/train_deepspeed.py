@@ -7,7 +7,8 @@ if ENABLE_DEBUG:
     if os.environ.get('RANK') == '0' or os.environ.get('LOCAL_RANK') == '0':
         debugpy.listen(('0.0.0.0', 5678))
         print(
-            f"Process with RANK {os.environ.get('RANK', 'N/A')} is listening on port 5678. Waiting for debugger attach..."
+            f"Process with RANK {os.environ.get('RANK', 'N/A')}"  # noqa: E251
+            " is listening on port 5678. Waiting for debugger attach..."
         )
         debugpy.wait_for_client()
         print("Debugger attached to RANK 0.")
@@ -115,7 +116,6 @@ class VLLMTrainer(nn.Module):
         loss = output.loss if hasattr(output, 'loss') else output
         return loss
 
-
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in b.items():
         if isinstance(v, dict) and isinstance(a.get(k), dict):
@@ -123,7 +123,6 @@ def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         else:
             a[k] = v
     return a
-
 
 def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
     """Return a placeholder loss for pipeline verification.
@@ -134,14 +133,12 @@ def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
         return 1e-6 * (z ** 2).mean()
     return (z * 0.0).sum()
 
-
 def get_cast_type(ds_config: Dict[str, Any]) -> torch.dtype:
     if 'bf16' in ds_config and ds_config['bf16'].get('enabled', False):
         return torch.bfloat16
     if 'fp16' in ds_config and ds_config['fp16'].get('enabled', False):
         return torch.float16
     return torch.float32
-
 
 def cast_model(model: nn.Module, dtype: torch.dtype) -> nn.Module:
     if dtype == torch.bfloat16:
@@ -151,7 +148,6 @@ def cast_model(model: nn.Module, dtype: torch.dtype) -> nn.Module:
     else:
         model = model.to(torch.float32)
     return model
-
 
 def train(args):
     cfg = load_config(args.config)
@@ -217,6 +213,7 @@ def train(args):
     # Resolve run/ckpt directories (support resume) with consistent RUN_ID across ranks
     train_cfg = cfg.get('train', {})
     resume_from = train_cfg.get('resume_from', '')
+    run_dir = None
     if resume_from:
         rf = Path(resume_from)
         if rf.name == 'checkpoints' and rf.is_dir():
@@ -225,11 +222,6 @@ def train(args):
         else:
             run_dir = rf
             ckpt_dir = run_dir / 'checkpoints'
-        if engine.global_rank == 0:
-            run_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-        if dist.is_initialized():
-            dist.barrier()
     else:
         base_root = Path(train_cfg.get('save_dir_root', 'runs'))
         run_id = os.environ.get('RUN_ID')
@@ -242,11 +234,18 @@ def train(args):
             run_id = obj[0]  # type: ignore
         run_dir = base_root / str(run_id)
         ckpt_dir = run_dir / 'checkpoints'
-        if engine.global_rank == 0:
-            run_dir.mkdir(parents=True, exist_ok=True)
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-        if dist.is_initialized():
-            dist.barrier()
+
+    # Create directories and define log path on rank 0
+    logits_log_path = None
+    if engine.global_rank == 0:
+        if run_dir is None: # Should not happen if not resuming, but as a safeguard
+            run_dir = Path(f"runs/{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        logits_log_path = run_dir / 'logits_visualization.log'
+
+    if dist.is_initialized():
+        dist.barrier()
 
     # TensorBoard writer (rank0 only)
     writer = None
@@ -266,6 +265,7 @@ def train(args):
 
     epochs = int(train_cfg.get('epochs', args.epochs))
     log_interval = int(train_cfg.get('log_interval', 10))
+    log_logits = bool(train_cfg.get('log_logits', True))
     val_interval = int(train_cfg.get('val_interval', 100))
     save_every = int(train_cfg.get('save_every', 0))  # 0 disables periodic save
 
@@ -321,7 +321,11 @@ def train(args):
                             writer.add_scalar('train/lr', float(pgs[0].get('lr', 0.0)), global_step)
                 except Exception:
                     pass
-            if engine.global_rank == 0 and (global_step % log_interval == 0):
+            if (
+                engine.global_rank == 0
+                and (global_step % log_interval == 0)
+                and log_logits
+            ):
                 loss_val = loss.item()
                 if tqdm is None:
                     print(f"epoch={epoch} step={global_step} loss={loss_val:.6f}")
@@ -343,7 +347,7 @@ def train(args):
 
                         # Get probabilities
                         probs = F.softmax(sample_logits, dim=-1)
-                        
+
                         # Get predicted token IDs
                         predicted_ids = torch.argmax(probs, dim=-1)
 
@@ -351,32 +355,40 @@ def train(args):
                         text_start_idx = (sample_labels != -100).nonzero(as_tuple=True)[0]
                         if text_start_idx.numel() > 0:
                             start = text_start_idx[0]
-                            
+
                             # Get tokenizer from the model
                             tokenizer = engine.module.llm.tokenizer
 
-                            log_lines = ["\n--- Logits Visualization ---"]
-                            log_lines.append(f"Sample: '{batch['text'][0]}'")
-                            log_lines.append("Pos |    GT Token    |   Pred Token   |  GT Prob  | Correct?")
-                            log_lines.append("-----------------------------------------------------------------")
+                            log_lines = ["\n--- Logits Visualization (Corrected) ---"]
+                            log_lines.append(f"Step: {global_step} | Sample: '{batch['text'][0]}'")
+                            log_lines.append("Pos(i)| Input Token(i) | Pred Token(i+1)| GT Token(i+1)  |  GT Prob  | Correct?")
+                            log_lines.append("------------------------------------------------------------------------------------")
 
                             # Visualize up to 15 tokens
-                            for i in range(start, min(start + 15, len(sample_labels))):
-                                gt_id = sample_labels[i].item()
-                                if gt_id == -100: continue
-                                
+                            for i in range(start, min(start + 15, len(sample_labels) - 1)):
+                                # The model at position 'i' predicts the token for position 'i+1'
+                                input_id = sample_labels[i].item()
+                                gt_id = sample_labels[i+1].item()
+
+                                # Skip prefix padding
+                                if input_id == -100: continue
+
                                 pred_id = predicted_ids[i].item()
                                 gt_prob = probs[i, gt_id].item()
-                                
+
+                                input_token = tokenizer.decode([input_id])
                                 gt_token = tokenizer.decode([gt_id])
                                 pred_token = tokenizer.decode([pred_id])
-                                
+
                                 is_correct = "✅" if pred_id == gt_id else "❌"
-                                
-                                log_lines.append(f"{i:<3} | {gt_token:>14} | {pred_token:>14} | {gt_prob:^9.2%} | {is_correct}")
-                            
+
+                                log_lines.append(f"{i:<6} | {input_token:>14} | {pred_token:>15} | {gt_token:>14} | {gt_prob:^9.2%} | {is_correct}")
+
                             log_lines.append("--- End Visualization ---\n")
-                            print("\n".join(log_lines))
+                            log_text = "\n".join(log_lines)
+                            if logits_log_path:
+                                with open(logits_log_path, "a", encoding="utf-8") as f:
+                                    f.write(log_text)
 
                 except Exception as e:
                     print(f"[WARN] Failed to visualize logits: {e}")
@@ -419,7 +431,7 @@ def evaluate(engine, loader: DataLoader) -> float:
             batch = {k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
         elif isinstance(batch, (tuple, list)):
             batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
-        loss, _, _ = engine(batch)
+        loss = engine(batch)
         local_sum += float(loss.item())
         local_count += 1
     # Aggregate across ranks to avoid desync
@@ -499,7 +511,6 @@ def sample_and_log_predictions(
     logging.info(log_text)
     if writer is not None:
         writer.add_text('val/samples', log_text, global_step)
-
 
 def main():
     parser = argparse.ArgumentParser()
