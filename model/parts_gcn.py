@@ -32,6 +32,7 @@ def _slice_pose_by_part(
 
 def _build_masks(
     pose_len: Optional[torch.Tensor],
+    last_chunk_valid_len: Optional[torch.Tensor],
     *,
     batch: int,
     num_chunks: int,
@@ -46,7 +47,25 @@ def _build_masks(
     pose_len = pose_len.to(device=device, dtype=torch.long)
     chunk_ids = torch.arange(num_chunks, device=device)
     chunk_mask = chunk_ids.unsqueeze(0) < pose_len.unsqueeze(1)  # [B, N]
-    frame_mask_bool = chunk_mask.view(-1, 1).expand(-1, chunk_len)  # [B*N, T]
+    
+    # Expand chunk mask to frame level
+    frame_mask_bool = chunk_mask.view(-1, 1).expand(-1, chunk_len).clone()  # [B*N, T]
+
+    # Refine mask for the last valid chunk of each sample
+    if last_chunk_valid_len is not None:
+        if last_chunk_valid_len.dim() != 1 or last_chunk_valid_len.numel() != batch:
+            raise ValueError("last_chunk_valid_len must be 1D with length equal to batch size.")
+        last_chunk_valid_len = last_chunk_valid_len.to(device=device, dtype=torch.long)
+        for i in range(batch):
+            # Index of the last valid chunk for sample i
+            last_valid_chunk_idx = pose_len[i] - 1
+            if last_valid_chunk_idx >= 0:
+                valid_frames = last_chunk_valid_len[i]
+                # Get the index in the flattened BN dimension
+                flat_idx = i * num_chunks + last_valid_chunk_idx
+                # Set the padding part of the mask for this specific chunk to False
+                frame_mask_bool[flat_idx, valid_frames:] = False
+
     frame_mask = frame_mask_bool.to(dtype)
     return frame_mask, frame_mask_bool, chunk_mask
 
@@ -128,6 +147,7 @@ class MultiPartGCNModel(nn.Module):
         *,
         part_lens: Sequence[int],
         pose_len: Optional[torch.Tensor] = None,
+        last_chunk_valid_len: Optional[torch.Tensor] = None,
         adjacency: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Run Uni-GCN encoders over chunked poses.
@@ -136,6 +156,7 @@ class MultiPartGCNModel(nn.Module):
             pose: Tensor shaped [B, N_chunk, chunk_len, sum_K, C].
             part_lens: Joint counts per part matching ``self.parts``.
             pose_len: Optional valid chunk counts per sample ``[B]``.
+            last_chunk_valid_len: Optional valid frame counts for the last chunk ``[B]``.
             adjacency: Part-wise adjacency matrices used on the first call.
 
         Returns:
@@ -172,6 +193,7 @@ class MultiPartGCNModel(nn.Module):
 
         frame_mask_float, frame_mask_bool, chunk_mask = _build_masks(
             pose_len,
+            last_chunk_valid_len,
             batch=batch_size,
             num_chunks=num_chunks,
             chunk_len=chunk_len,

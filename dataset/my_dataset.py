@@ -284,6 +284,7 @@ class MyDataset(Dataset):
                     pose = self.mask_augment(pose, mask_prob, rng)
 
         t_prime = pose.shape[0]
+        original_t_prime = t_prime
         if self.pad_last:
             # pad to fit sliding window
             if t_prime < self.window:
@@ -344,6 +345,8 @@ class MyDataset(Dataset):
             k: torch.from_numpy(v)
             for k, v in self.get_adjacency_matrix(normalize=True).items()
         }  # {str: np.ndarray}
+        sample['original_frame_cnt'] = original_t_prime
+        sample['stride'] = self.stride
         return sample
 
 
@@ -357,12 +360,21 @@ def my_collate_fn(batch):
 
     body_parts = list(batch[0]["pose"].keys())
 
-    def _get_chunk_lens(item) -> int:
+    def _get_chunk_cnt(item) -> int:
+        # 获取某个样本的chunk数量，并确保所有part的chunk数量相同
         num_chunks = [item["pose"][part].shape[0] for part in body_parts]
         assert all(
             n == num_chunks[0] for n in num_chunks
         ), "所有part的chunk数量必须相同"
         return num_chunks[0]
+
+    def _get_chunk_len(item) -> int:
+        # 获取某个样本的chunk长度，并确保所有part的chunk长度相同
+        chunk_lens = [item["pose"][part].shape[1] for part in body_parts]
+        assert all(
+            l == chunk_lens[0] for l in chunk_lens
+        ), "所有part的chunk长度必须相同"
+        return chunk_lens[0]
 
     def _stack_parts(
         poses: Dict[str, torch.Tensor],
@@ -376,21 +388,34 @@ def my_collate_fn(batch):
             part_lens,
         )  # (N, window, sum(K_part), C), List[int]
 
+    def _calc_effecient_frames_at_last_chunk(item) -> int:
+        # 计算最后一个chunk中有效帧的数量
+        chunk_cnt = _get_chunk_cnt(item)
+        chunk_len = _get_chunk_len(item)
+        stride = item['stride']
+        total_effecient_frames = item['original_frame_cnt']
+        real_sent_frames = (chunk_cnt - 1) * stride + chunk_len
+        if real_sent_frames <= total_effecient_frames:
+            return chunk_len
+        return total_effecient_frames - (chunk_cnt - 1) * stride
+
     padded_poses = []
     pose_lens = []
     text_list = []
     gloss_list = []
     gloss_lens = []
+    last_chunk_effecient_frames = []
 
-    max_chunks = max(_get_chunk_lens(item) for item in batch)
+    max_chunks = max(_get_chunk_cnt(item) for item in batch)
     max_gloss_len = (
         max(len(item['gloss']) for item in batch) if batch[0]['gloss'] else 0
     )
     part_lens = None  # List[int], sum(K_part)
     for i, item in enumerate(batch):
-        num_chunks = _get_chunk_lens(item)
+        num_chunks = _get_chunk_cnt(item)
         pose_lens.append(num_chunks)
         text_list.append(item['text'])
+        last_chunk_effecient_frames.append(_calc_effecient_frames_at_last_chunk(item))
         if item['gloss']:
             gloss_list.append(item['gloss'])
             gloss_lens.append(len(item['gloss']))
@@ -428,6 +453,9 @@ def my_collate_fn(batch):
         "parts": body_parts,  # 便于下游知道顺序
         "part_lens": part_lens,  # List[int], 对应每个part的关键点数量
         "adjacency_matrix": batch[0]["adjacency_matrix"],  # {str: Tensor}
+        "last_chunk_effecient_frames": torch.tensor(
+            last_chunk_effecient_frames, dtype=torch.long
+        ),  # (B,), 代表每个样本最后一个有效chunk中有效帧的数量，即先使用pose_len来决定多少个chunk是有效的，然后对于最后一个有效chunk，只使用前多少帧是有效的
     }
     return out
 

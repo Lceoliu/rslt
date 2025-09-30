@@ -89,6 +89,7 @@ class VisualEncoder(nn.Module):
         *,
         part_lens: Sequence[int],
         pose_len: Optional[torch.Tensor] = None,
+        last_chunk_valid_len: Optional[torch.Tensor] = None,
         adjacency: Optional[Dict[str, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode chunked pose tensors.
@@ -97,6 +98,7 @@ class VisualEncoder(nn.Module):
             pose: [B, N_chunk, chunk_len, sum_K, C]
             part_lens: Joint counts per part matching ``self.parts``.
             pose_len: Optional valid chunk counts per sample [B].
+            last_chunk_valid_len: Optional valid frame counts for the last chunk ``[B]``.
             adjacency: Part adjacency matrices for the first call.
 
         Returns:
@@ -114,6 +116,7 @@ class VisualEncoder(nn.Module):
             pose,
             part_lens=part_lens,
             pose_len=pose_len,
+            last_chunk_valid_len=last_chunk_valid_len,
             adjacency=adjacency,
         )
         bn, part_count, _, embed_dim = _reshape_features(features)

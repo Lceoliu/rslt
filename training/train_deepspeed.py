@@ -85,24 +85,28 @@ class VLLMTrainer(nn.Module):
 
     def forward(self, batch: Dict[str, Any]):
         if not isinstance(batch, dict):
-            raise TypeError('Expected batch dict from dataloader.')
+            raise TypeError('Expected batch dict from dataloaloader.')
         pose = batch['pose']
         part_lens = batch['part_lens']
         adjacency = batch['adjacency_matrix']
         texts = batch.get('text')
         pose_len = batch.get('pose_len')
+        last_chunk_valid_len = batch.get('last_chunk_valid_len')
+
         if texts is None:
             raise ValueError('Batch must include text field.')
 
         device = next(self.visual.parameters()).device
         pose = pose.to(device)
         pose_len = pose_len.to(device) if pose_len is not None else None
+        last_chunk_valid_len = last_chunk_valid_len.to(device) if last_chunk_valid_len is not None else None
         adjacency = {k: v.to(device) for k, v in adjacency.items()}
 
         tokens, token_mask, _ = self.visual(
             pose,
             part_lens=part_lens,
             pose_len=pose_len,
+            last_chunk_valid_len=last_chunk_valid_len,
             adjacency=adjacency,
         )
 
