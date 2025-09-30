@@ -407,8 +407,6 @@ def train(args):
                         sample_and_log_predictions(engine, val_loader, cfg, global_step, writer)
                     except Exception as e:
                         print(f"[warn] sample_and_log_predictions failed: {e}")
-                # Save checkpoint on all ranks to avoid deadlocks
-                engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epoch})
 
     eval_stat = evaluate(engine, val_loader)
     if engine.global_rank == 0:

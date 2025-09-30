@@ -1,7 +1,8 @@
 train:
   seed: 3407
-  epochs: 20
-  log_interval: 10
+  epochs: 3
+  log_logits: true
+  log_interval: 1000
   val_interval: 250
   save_dir_root: runs
   save_every: 1000
@@ -48,7 +49,7 @@ llm:
   model_name_or_path: /workspace/Qwen
   trust_remote_code: true
   max_text_len: 128
-  freeze_lm: false
+  freeze_lm: true
   gradient_checkpointing: false
   boc_token: "<BOC>"
   eoc_token: "<EOC>"
