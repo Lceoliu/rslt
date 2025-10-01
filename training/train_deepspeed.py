@@ -356,7 +356,9 @@ def train(args):
                         predicted_ids = torch.argmax(probs, dim=-1)
 
                         # Find where the actual text labels start (ignore -100)
-                        text_start_idx = (sample_labels != -100).nonzero(as_tuple=True)[0]
+                        text_start_idx = (
+                            sample_labels == engine.module.llm._special_ids['bot']
+                        ).nonzero(as_tuple=True)[0]
                         if text_start_idx.numel() > 0:
                             start = text_start_idx[0]
 

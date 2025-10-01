@@ -1,9 +1,9 @@
-from __future__ import annotations
-
 import argparse
 import json
 from pathlib import Path
+import pdb
 from typing import Any, Dict, List
+import torch.nn.functional as F
 
 import torch
 
@@ -66,12 +66,71 @@ def predict_for_sample(
         adjacency=adjacency,
     )
     loss = 0.0
+    log_text = None
     if gt_text is not None:
-        output = module.llm(
+        output, labels = module.llm(
             tokens,
             token_mask,
             [gt_text],
         )
+        logits = output.logits
+        if logits is not None and labels is not None:
+            # pdb.set_trace()
+            # Get the first sample in the batch
+            sample_logits = logits[0]
+            sample_labels = labels[0]
+
+            # Get probabilities
+            probs = F.softmax(sample_logits, dim=-1)
+
+            # Get predicted token IDs
+            predicted_ids = torch.argmax(probs, dim=-1)
+
+            # Find where the actual text labels start (ignore -100)
+            text_start_idx = (sample_labels == module.llm._special_ids['bot']).nonzero(
+                as_tuple=True
+            )[0]
+            if text_start_idx.numel() > 0:
+                start = text_start_idx[0]
+
+                # Get tokenizer from the model
+                tokenizer = module.llm.tokenizer
+
+                log_lines = ["\n--- Logits Visualization (Corrected) ---"]
+                log_lines.append(f"Sample: '{batch['text'][0]}'")
+                log_lines.append(
+                    "Pos(i)| Input Token(i) | Pred Token(i+1)| GT Token(i+1)  |  GT Prob  | Correct?"
+                )
+                log_lines.append(
+                    "------------------------------------------------------------------------------------"
+                )
+
+                # Visualize up to 15 tokens
+                for i in range(start, min(start + 15, len(sample_labels) - 1)):
+                    # The model at position 'i' predicts the token for position 'i+1'
+                    input_id = sample_labels[i].item()
+                    gt_id = sample_labels[i + 1].item()
+
+                    # Skip prefix padding
+                    if input_id == -100:
+                        continue
+
+                    pred_id = predicted_ids[i].item()
+                    gt_prob = probs[i, gt_id].item()
+
+                    input_token = tokenizer.decode([input_id])
+                    gt_token = tokenizer.decode([gt_id])
+                    pred_token = tokenizer.decode([pred_id])
+
+                    is_correct = "✅" if pred_id == gt_id else "❌"
+
+                    log_lines.append(
+                        f"{i:<6} | {input_token:>14} | {pred_token:>15} | {gt_token:>14} | {gt_prob:^9.2%} | {is_correct}"
+                    )
+
+                log_lines.append("--- End Visualization ---\n")
+                log_text = "\n".join(log_lines)
+
         if hasattr(output, 'loss'):
             loss = output.loss
     predictions = module.llm.generate(
@@ -87,6 +146,7 @@ def predict_for_sample(
         "prediction": predictions[0],
         "ground_truth": gt_text,
         "loss": float(loss) if loss else None,
+        "logits_visualization": log_text if gt_text is not None else None,
     }
 
 
@@ -161,6 +221,11 @@ def main() -> None:
             gt_text=gt_text,
         )
         key = f"{args.split}_batch{idx}"
+
+        with open(out_dir / "partial.txt", "a", encoding="utf-8") as f:
+            f.write(f"=== Sample {key} ===\n")
+            f.write(result["logits_visualization"])
+        result.pop("logits_visualization", None)
         results[key] = result
         (out_dir / "partial.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
