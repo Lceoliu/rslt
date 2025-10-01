@@ -18,7 +18,8 @@ import argparse
 import os, sys, random, logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
+
 sys.path.append(Path(__file__).parent.parent.as_posix())
 
 import torch
@@ -46,6 +47,7 @@ from model.embedding import build_visual_encoder
 from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
 from training.utils import set_seed
+from utils.log_logits import log_logits
 
 import pdb
 
@@ -62,14 +64,14 @@ class VLLMTrainer(nn.Module):
         print(f"Building LLM: {model_name}")
         trust_remote_code = bool(llm_cfg.get('trust_remote_code', True))
         gradient_checkpointing = bool(llm_cfg.get('gradient_checkpointing', False))
-        freeze_lm = bool(llm_cfg.get('freeze_lm', False))
+        self.freeze_lm = bool(llm_cfg.get('freeze_lm', False))
         max_text_len = int(llm_cfg.get('max_text_len', 128))
         self.llm = LLMWithVisualPrefix(
             model_name_or_path=model_name,
             trust_remote_code=trust_remote_code,
             max_text_len=max_text_len,
             gradient_checkpointing=gradient_checkpointing,
-            freeze_lm=freeze_lm,
+            freeze_lm=self.freeze_lm,
             boc_token=llm_cfg.get('boc_token', '<BOC>'),
             eoc_token=llm_cfg.get('eoc_token', '<EOC>'),
             bot_token=llm_cfg.get('bot_token', '<BOT>'),
@@ -83,9 +85,25 @@ class VLLMTrainer(nn.Module):
         self.last_logits = None
         self.last_labels = None
 
+    def get_parameter_groups(self) -> List[Dict]:
+        """Separate parameters for differential learning rates."""
+        train_cfg = self.cfg.get("train", {})
+        visual_lr = float(train_cfg.get("visual_lr", 5e-5))
+        llm_lr = float(train_cfg.get("llm_lr", 1e-6))
+
+        if self.freeze_lm:
+            print(f"LLM is frozen. Only training visual encoder with lr={visual_lr}")
+            return [{"params": self.visual.parameters(), "lr": visual_lr}]
+
+        print(f"Training with differential LRs: visual_lr={visual_lr}, llm_lr={llm_lr}")
+        return [
+            {"params": self.visual.parameters(), "lr": visual_lr},
+            {"params": self.llm.parameters(), "lr": llm_lr},
+        ]
+
     def forward(self, batch: Dict[str, Any]):
         if not isinstance(batch, dict):
-            raise TypeError('Expected batch dict from dataloaloader.')
+            raise TypeError('Expected batch dict from dataloader.')
         pose = batch['pose']
         part_lens = batch['part_lens']
         adjacency = batch['adjacency_matrix']
@@ -205,8 +223,11 @@ def train(args):
     net = cast_model(net, get_cast_type(ds_config))
     print(f"Model cast to {next(net.parameters()).dtype}.")
 
+    # Get parameter groups for differential learning rates
+    param_groups = net.get_parameter_groups()
+
     engine, optimizer, _, scheduler = deepspeed.initialize(
-        args=args, model=net, model_parameters=net.parameters()
+        args=args, model=net, model_parameters=param_groups
     )
     device = engine.device
     print(
@@ -242,8 +263,15 @@ def train(args):
     # Create directories and define log path on rank 0
     logits_log_path = None
     if engine.global_rank == 0:
-        if run_dir is None: # Should not happen if not resuming, but as a safeguard
-            run_dir = Path(f"runs/{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        if run_dir is None:
+            raise ValueError("run_dir is not set for rank 0.")
+        if resume_from:
+            run_dir_name = run_dir.name
+            run_dir = run_dir.parent / f"{run_dir_name}_resume"
+            if run_dir.exists():
+                print(
+                    f"Resuming run, but {run_dir} already exists. New run will be overwritten."
+                )
         run_dir.mkdir(parents=True, exist_ok=True)
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         logits_log_path = run_dir / 'logits_visualization.log'
@@ -322,7 +350,13 @@ def train(args):
                     if hasattr(engine, 'optimizer') and engine.optimizer is not None:
                         pgs = getattr(engine.optimizer, 'param_groups', None)
                         if pgs:
-                            writer.add_scalar('train/lr', float(pgs[0].get('lr', 0.0)), global_step)
+                            # Log learning rates for both groups
+                            for i, pg in enumerate(pgs):
+                                writer.add_scalar(
+                                    f'train/lr_group_{i}',
+                                    float(pg.get('lr', 0.0)),
+                                    global_step,
+                                )
                 except Exception:
                     pass
             if (
@@ -342,67 +376,30 @@ def train(args):
 
                 # Logits visualization
                 try:
-                    logits = engine.module.last_logits
-                    labels = engine.module.last_labels
-                    if logits is not None and labels is not None:
-                        # Get the first sample in the batch
-                        sample_logits = logits[0]
-                        sample_labels = labels[0]
-
-                        # Get probabilities
-                        probs = F.softmax(sample_logits, dim=-1)
-
-                        # Get predicted token IDs
-                        predicted_ids = torch.argmax(probs, dim=-1)
-
-                        # Find where the actual text labels start (ignore -100)
-                        text_start_idx = (
-                            sample_labels == engine.module.llm._special_ids['bot']
-                        ).nonzero(as_tuple=True)[0]
-                        if text_start_idx.numel() > 0:
-                            start = text_start_idx[0]
-
-                            # Get tokenizer from the model
-                            tokenizer = engine.module.llm.tokenizer
-
-                            log_lines = ["\n--- Logits Visualization (Corrected) ---"]
-                            log_lines.append(f"Step: {global_step} | Sample: '{batch['text'][0]}'")
-                            log_lines.append("Pos(i)| Input Token(i) | Pred Token(i+1)| GT Token(i+1)  |  GT Prob  | Correct?")
-                            log_lines.append("------------------------------------------------------------------------------------")
-
-                            # Visualize up to 15 tokens
-                            for i in range(start, min(start + 15, len(sample_labels) - 1)):
-                                # The model at position 'i' predicts the token for position 'i+1'
-                                input_id = sample_labels[i].item()
-                                gt_id = sample_labels[i+1].item()
-
-                                # Skip prefix padding
-                                if input_id == -100: continue
-
-                                pred_id = predicted_ids[i].item()
-                                gt_prob = probs[i, gt_id].item()
-
-                                input_token = tokenizer.decode([input_id])
-                                gt_token = tokenizer.decode([gt_id])
-                                pred_token = tokenizer.decode([pred_id])
-
-                                is_correct = "✅" if pred_id == gt_id else "❌"
-
-                                log_lines.append(f"{i:<6} | {input_token:>14} | {pred_token:>15} | {gt_token:>14} | {gt_prob:^9.2%} | {is_correct}")
-
-                            log_lines.append("--- End Visualization ---\n")
-                            log_text = "\n".join(log_lines)
-                            if logits_log_path:
-                                with open(logits_log_path, "a", encoding="utf-8") as f:
-                                    f.write(log_text)
+                    if (
+                        engine.module.last_logits is not None
+                        and engine.module.last_labels is not None
+                    ):
+                        log_logits(
+                            engine.module,
+                            engine.module.last_logits,
+                            engine.module.last_labels,
+                            (
+                                batch['text'][0]
+                                if isinstance(batch, dict) and 'text' in batch
+                                else ""
+                            ),
+                            logits_log_path,
+                            step=global_step,
+                        )
 
                 except Exception as e:
                     print(f"[WARN] Failed to visualize logits: {e}")
 
             # Periodic checkpointing on all ranks
-            if save_every > 0 and (global_step % save_every == 0):
+            if save_every > 0 and (global_step % save_every == 0) and global_step > 0:
                 engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epoch})
-            if global_step % val_interval == 0:
+            if global_step % val_interval == 0 and global_step > 0:
                 eval_stat = evaluate(engine, val_loader)
                 if engine.global_rank == 0:
                     if writer is not None:

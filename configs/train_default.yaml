@@ -1,10 +1,10 @@
 train:
   seed: 3407
-  epochs: 5
+  epochs: 10
   log_logits: true
-  log_interval: 500
+  log_interval: 1000
   val_interval: 200
-  save_dir_root: runs
+  save_dir_root: runs/stage1
   save_every: 1000
   resume_from: ""
 
