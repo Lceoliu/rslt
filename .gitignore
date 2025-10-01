@@ -7,4 +7,3 @@ AGENTS.md
 !tests/test_*.py
 
 runs/
-configs/ds_config_*.json
