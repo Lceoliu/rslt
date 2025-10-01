@@ -86,14 +86,12 @@ class NormalizeProcessor:
             part_matrices = []
             for part in self.body_parts:
                 start, end = self.body_part_intervals[part]
-                if self.discarded_keypoints:
-                    indices = [
-                        self.indices_map[idx]
-                        for idx in range(start, end)
-                        if idx in self.all_indices
-                    ]
-                else:
-                    indices = list(range(start, end))
+
+                indices = [
+                    self.indices_map[idx]
+                    for idx in range(start, end)
+                    if idx in self.all_indices
+                ]
                 part_matrix = adjacency_matrix[np.ix_(indices, indices)]
                 part_matrices.append(part_matrix)
             adjacency_matrix = {
