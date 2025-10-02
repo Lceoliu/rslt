@@ -55,17 +55,16 @@ class ChunkTokenEncoder(nn.Module):
         self.num_tokens = num_tokens
         self.model_dim = model_dim
 
-        # 1. Input projection
         self.in_proj = nn.Linear(in_dim, model_dim) if in_dim != model_dim else nn.Identity()
-        
+
         if mlp_dim is None:
             mlp_dim = max(4 * model_dim, 1024)
 
-        # 2. Positional and Slot Embeddings
+        # Positional and Slot Embeddings
         self.temporal_pos_embed = nn.Parameter(torch.zeros(1, max_temporal_len, model_dim))
         self.slot_pos_embed = nn.Parameter(torch.zeros(1, num_tokens, model_dim))
 
-        # 3. Visual Encoder (Self-Attention)
+        # Visual Encoder (Self-Attention)
         # Using norm_first=True for Pre-LN, which is more stable.
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=model_dim,
@@ -78,7 +77,7 @@ class ChunkTokenEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # 4. Q-Former part: Learnable queries and Cross-attention decoder
+        # Q-Former part: Learnable queries and Cross-attention decoder
         self.query_tokens = nn.Parameter(torch.zeros(1, num_tokens, model_dim))
 
         decoder_layer = nn.TransformerDecoderLayer(
@@ -105,7 +104,7 @@ class ChunkTokenEncoder(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
         elif isinstance(m, nn.Parameter):
-             # Use truncated normal for learnable embeddings/tokens
+            # Use truncated normal for learnable embeddings/tokens
             if m.dim() > 1:
                 _trunc_normal_(m, std=.02)
 
@@ -127,8 +126,7 @@ class ChunkTokenEncoder(nn.Module):
         """
         if x.dim() != 3:
             raise ValueError(f"Expected [B, T, F] input, got {x.shape}")
-        
-        # 0. Get target dtype and device from a persistent parameter
+
         target_dtype = self.query_tokens.dtype
         target_device = self.query_tokens.device
         x = x.to(device=target_device, dtype=target_dtype)
@@ -140,22 +138,19 @@ class ChunkTokenEncoder(nn.Module):
                 raise ValueError("frame_mask shape must match the batch/time dims of x.")
             key_padding_mask = ~frame_mask.bool()
 
-        # 1. Project input features
         x_proj = self.in_proj(x)
 
-        # 2. Add temporal positional embedding
+        # Add temporal positional embedding
         if T > self.temporal_pos_embed.shape[1]:
             raise ValueError(f"Input sequence length ({T}) exceeds max_temporal_len ({self.temporal_pos_embed.shape[1]})")
         x_proj = x_proj + self.temporal_pos_embed[:, :T, :]
 
-        # 3. Process visual features with self-attention encoder to get memory
         memory = self.encoder(x_proj, src_key_padding_mask=key_padding_mask)
 
-        # 4. Prepare queries with slot positional embedding
+        # queries with slot positional embedding
         query = self.query_tokens + self.slot_pos_embed
         query = query.expand(B, -1, -1)
 
-        # 5. Cross-attend queries to the visual memory
         output_tokens = self.decoder(
             tgt=query, 
             memory=memory, 
@@ -163,9 +158,9 @@ class ChunkTokenEncoder(nn.Module):
             memory_key_padding_mask=key_padding_mask
         )
 
-        # 6. Zero out tokens from fully padded chunks
+        # Zero out tokens from fully padded chunks
         if frame_mask is not None:
             chunk_alive = frame_mask.any(dim=1, keepdim=True).to(output_tokens.dtype)
             output_tokens = output_tokens * chunk_alive.unsqueeze(-1)
-            
+
         return output_tokens
