@@ -221,8 +221,10 @@ class VLLMTrainer(nn.Module):
             adjacency=adjacency,
         )
         # tokens: [B, N, P, E], token_mask: [B, N, P]
-        contrastive_loss = self.get_contrastive_loss(
-            tokens, token_mask, texts, tau=self.tau
+        contrastive_loss = (
+            self.get_contrastive_loss(tokens, token_mask, texts, tau=self.tau)
+            if self.contrastive_alpha > 0
+            else None
         )
 
         # The llm.forward now returns (outputs, labels)

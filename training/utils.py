@@ -59,11 +59,11 @@ def log_logits(module, logits, labels, gt_text, log_path, step=None):
                         f"{i:<6} | {input_token:>14} | {pred_token:>15} | {gt_token:>14} | {gt_prob:^9.2%} | {is_correct}"
                     )
 
-                    log_lines.append("--- End Visualization ---\\n")
-                    log_text = "\n".join(log_lines)
-                    if log_path:
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            f.write(log_text)
+                log_lines.append("--- End Visualization ---\n")
+                log_text = "\n".join(log_lines)
+                if log_path:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write(log_text)
     except Exception as e:
         print(f"[ERROR in log_logits] {type(e).__name__}: {e}")
         import traceback

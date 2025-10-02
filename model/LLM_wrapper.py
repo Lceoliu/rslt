@@ -363,9 +363,12 @@ class LLMWithVisualPrefix(nn.Module):
 
         random_ids = torch.randint(0, vocab_size, (num_samples,), device=device)
 
-        negative_ids = random_ids[
-            ~random_ids.unsqueeze(0).isin(positive_ids.unsqueeze(1)).any(0)
-        ]
+        # Create mask to filter out positive IDs using broadcasting
+        # positive_ids: [L], random_ids: [num_samples]
+        # Expand to [num_samples, L] and [num_samples, L] for comparison
+        mask = (random_ids.unsqueeze(1) == positive_ids.unsqueeze(0)).any(dim=1)
+        negative_ids = random_ids[~mask]
+
         if negative_ids.numel() < num_samples:
             # If not enough negative samples, fallback to random sampling
             negative_ids = torch.randint(0, vocab_size, (num_samples,), device=device)
