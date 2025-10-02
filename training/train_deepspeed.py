@@ -305,11 +305,12 @@ def train(args):
     if 'scheduler' in ds_config and isinstance(ds_config['scheduler'], dict):
         sch = ds_config['scheduler']
         params = sch.setdefault('params', {})
-        # Sync warmup_max_lr with optimizer lr
-        if 'optimizer' in ds_config and isinstance(ds_config['optimizer'], dict):
-            opt_lr = ds_config['optimizer'].get('params', {}).get('lr')
-            if opt_lr is not None:
-                params['warmup_max_lr'] = opt_lr
+        # Sync warmup_max_lr with the maximum lr from train config
+        train_cfg = cfg.get('train', {})
+        visual_lr = float(train_cfg.get('visual_lr', 5e-5))
+        llm_lr = float(train_cfg.get('llm_lr', 1e-6))
+        max_lr = max(visual_lr, llm_lr)
+        params['warmup_max_lr'] = max_lr
         # If warmup_num_steps is a fraction (<1), convert to integer steps
         wms = params.get('warmup_num_steps', None)
         if isinstance(wms, float) and wms > 0.0 and wms < 1.0:
@@ -320,7 +321,10 @@ def train(args):
         else:
             # default to 5% if unspecified or invalid
             params['warmup_num_steps'] = max(1, int(round(0.05 * total_num_steps)))
-        params['total_num_steps'] = total_num_steps
+        if params.get('total_num_steps') == 'auto':
+            params['total_num_steps'] = total_num_steps
+        elif 'total_num_steps' not in params:
+            params['total_num_steps'] = total_num_steps
 
     # Build composite trainer module (visual encoder + LLM)
     net = VLLMTrainer(cfg)
