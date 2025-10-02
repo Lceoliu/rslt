@@ -46,8 +46,7 @@ from model.config import load_config
 from model.embedding import build_visual_encoder
 from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
-from training.utils import set_seed
-from utils.log_logits import log_logits
+from training.utils import set_seed, log_logits
 
 import pdb
 
@@ -240,13 +239,20 @@ def train(args):
     resume_from = train_cfg.get('resume_from', '')
     run_dir = None
     if resume_from:
-        rf = Path(resume_from)
+        rf = Path(resume_from).resolve()
         if rf.name == 'checkpoints' and rf.is_dir():
             ckpt_dir = rf
             run_dir = rf.parent
+        elif "global_step" in rf.name and rf.is_dir():
+            ckpt_dir = rf
+            run_dir = rf.parent.parent
+            if not ckpt_dir.exists():
+                raise ValueError(f"resume_from checkpoints dir not found: {ckpt_dir}")
         else:
             run_dir = rf
             ckpt_dir = run_dir / 'checkpoints'
+            if not ckpt_dir.exists():
+                raise ValueError(f"resume_from checkpoints dir not found: {ckpt_dir}")
     else:
         base_root = Path(train_cfg.get('save_dir_root', 'runs'))
         run_id = os.environ.get('RUN_ID')
@@ -273,6 +279,7 @@ def train(args):
                     f"Resuming run, but {run_dir} already exists. New run will be overwritten."
                 )
         run_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_dir = ckpt_dir.resolve()
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         logits_log_path = run_dir / 'logits_visualization.log'
 
@@ -300,23 +307,31 @@ def train(args):
     log_logits = bool(train_cfg.get('log_logits', True))
     val_interval = int(train_cfg.get('val_interval', 100))
     save_every = int(train_cfg.get('save_every', 0))  # 0 disables periodic save
+    ckpt_tag = str(train_cfg.get('ckpt_tag', None)).strip()
+    resume_for_new_stage = bool(train_cfg.get('resume_for_new_stage', False))
 
     # Optionally resume engine state
     global_step = 0
     start_epoch = 0
     if resume_from:
-        try:
-            load_path, client_sd = engine.load_checkpoint(str(ckpt_dir), tag=None)
-            if engine.global_rank == 0:
-                print(f"Resumed from checkpoint: {load_path}")
-            if isinstance(client_sd, dict):
-                global_step = int(client_sd.get('global_step', 0))
-                start_epoch = int(client_sd.get('epoch', 0))
-        except Exception as e:
-            if engine.global_rank == 0:
-                print(f"[WARN] Failed to resume from {ckpt_dir}: {e}")
-            global_step = 0
-            start_epoch = 0
+        if ckpt_tag == '':
+            ckpt_tag = None  # load latest
+        print(f"Loading checkpoint from {ckpt_dir}, tag: {ckpt_tag or 'latest'}")
+        load_path, client_sd = engine.load_checkpoint(
+            str(ckpt_dir),
+            tag=ckpt_tag,
+            load_module_strict=not resume_for_new_stage,
+            load_optimizer_states=not resume_for_new_stage,
+            load_lr_scheduler_states=not resume_for_new_stage,
+            load_module_only=resume_for_new_stage,
+        )
+        if engine.global_rank == 0:
+            print(50 * '=')
+            print(f"Resumed from checkpoint: {load_path}")
+            print(50 * '=')
+        if isinstance(client_sd, dict):
+            global_step = int(client_sd.get('global_step', 0))
+            start_epoch = int(client_sd.get('epoch', 0))
 
     for epoch in range(start_epoch, epochs):
         if hasattr(train_loader, 'sampler') and hasattr(
