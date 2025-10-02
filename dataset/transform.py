@@ -128,33 +128,35 @@ class NormalizeProcessor:
             for k, v in splited_kpts.items()
             if v is not None
         }
-        # if generate_video:
-        #     self.visualize_keypoints(
-        #         splited_kpts,
-        #         # original_size=(W, H),
-        #         edges=self.edges,
-        #         body_part_start_idx=self.body_part_start_idx,
-        #         save_path=TEST_OUTPUT_DIR / 'keypoints_visualization_interpolated.mp4',
-        #     )
+        if generate_video:
+            self.visualize_keypoints(
+                splited_kpts,
+                # original_size=(W, H),
+                edges=self.edges,
+                body_part_start_idx=self.body_part_start_idx,
+                keep_indices=self.all_indices,
+                save_path=TEST_OUTPUT_DIR / 'keypoints_visualization_interpolated.mp4',
+            )
         splited_kpts = self._centralize(splited_kpts)  # 中心化
-        # if generate_video:
-        #     self.visualize_keypoints(
-        #         splited_kpts,
-        #         # original_size=(W, H),
-        #         edges=self.edges,
-        #         body_part_start_idx=self.body_part_start_idx,
-        #         save_path=TEST_OUTPUT_DIR / 'keypoints_visualization_centralized.mp4',
-        #     )
+        if generate_video:
+            self.visualize_keypoints(
+                splited_kpts,
+                # original_size=(W, H),
+                edges=self.edges,
+                body_part_start_idx=self.body_part_start_idx,
+                keep_indices=self.all_indices,
+                save_path=TEST_OUTPUT_DIR / 'keypoints_visualization_centralized.mp4',
+            )
         splited_kpts = self._bone_normalize(splited_kpts, unit_length=8.0)  # 骨骼归一化
 
-        # if generate_video:
-        #     self.visualize_keypoints(
-        #         splited_kpts,
-        #         edges=self.edges,
-        #         body_part_start_idx=self.body_part_start_idx,
-        #         keep_indices=self.all_indices,
-        #         save_path=save_video_path / 'keypoints_visualization_normalized.mp4',
-        #     )
+        if generate_video:
+            self.visualize_keypoints(
+                splited_kpts,
+                edges=self.edges,
+                body_part_start_idx=self.body_part_start_idx,
+                keep_indices=self.all_indices,
+                save_path=save_video_path / 'keypoints_visualization_normalized.mp4',
+            )
         splited_kpts = self._discard_keypoints(splited_kpts)  # 舍弃部分关键点
         return splited_kpts
 
@@ -469,6 +471,9 @@ class NormalizeProcessor:
 if __name__ == "__main__":
     test_data_dir = Path(__file__).parent / 'test_data'
     npy_files = list(test_data_dir.glob('*.npy'))
+    npy_files = [
+        f for f in npy_files if f.name == "939a88062dc51ff86accd5635bfe3523.npy"
+    ]
     assert len(npy_files) > 0, f'No .npy files found in {test_data_dir}'
     for i in range(len(npy_files)):
         if i >= 1:

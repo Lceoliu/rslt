@@ -48,7 +48,6 @@ from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
 from training.utils import set_seed, log_logits
 
-import pdb
 
 class VLLMTrainer(nn.Module):
     """Couple the visual encoder with the language model for training."""
@@ -96,12 +95,26 @@ class VLLMTrainer(nn.Module):
 
         if self.freeze_lm:
             print(f"LLM is frozen. Only training visual encoder with lr={visual_lr}")
-            return [{"params": self.visual.parameters(), "lr": visual_lr}]
+            return [
+                {
+                    "params": self.visual.parameters(),
+                    "lr": visual_lr,
+                    "initial_lr": visual_lr,
+                }
+            ]
 
         print(f"Training with differential LRs: visual_lr={visual_lr}, llm_lr={llm_lr}")
         return [
-            {"params": self.visual.parameters(), "lr": visual_lr},
-            {"params": self.llm.parameters(), "lr": llm_lr},
+            {
+                "params": self.visual.parameters(),
+                "lr": visual_lr,
+                "initial_lr": visual_lr,
+            },
+            {
+                "params": self.llm.parameters(),
+                "lr": llm_lr,
+                "initial_lr": llm_lr,
+            },
         ]
 
     def get_diverse_loss(
@@ -263,6 +276,22 @@ def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
         return 1e-6 * (z ** 2).mean()
     return (z * 0.0).sum()
 
+
+
+def _sync_param_group_lrs(engine, target_lrs):
+    optimizer = getattr(engine, "optimizer", None)
+    if optimizer is None:
+        return
+    groups = optimizer.param_groups
+    for group, lr in zip(groups, target_lrs):
+        group["lr"] = lr
+        group["initial_lr"] = lr
+    scheduler = getattr(engine, "lr_scheduler", None)
+    if scheduler is not None:
+        sched_groups = getattr(scheduler, "param_groups", None)
+        if sched_groups:
+            for group, lr in zip(sched_groups, target_lrs):
+                group["initial_lr"] = lr
 def get_cast_type(ds_config: Dict[str, Any]) -> torch.dtype:
     if 'bf16' in ds_config and ds_config['bf16'].get('enabled', False):
         return torch.bfloat16
@@ -337,10 +366,12 @@ def train(args):
 
     # Get parameter groups for differential learning rates
     param_groups = net.get_parameter_groups()
+    target_lrs = [float(pg.get("lr", 0.0)) for pg in param_groups]
 
     engine, optimizer, _, scheduler = deepspeed.initialize(
         args=args, model=net, model_parameters=param_groups
     )
+    _sync_param_group_lrs(engine, target_lrs)
     device = engine.device
     print(
         f"DeepSpeed engine initialized. Local rank: {engine.local_rank}, Global rank: {engine.global_rank}"
@@ -465,8 +496,7 @@ def train(args):
                 batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
             with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
                 loss = engine(batch)  # scalar CE loss from LLM
-            # pdb.set_trace()
-            engine.backward(loss)
+                engine.backward(loss)
             engine.step()
             global_step += 1
             if hasattr(engine.module, 'current_epoch'):
