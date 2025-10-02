@@ -18,7 +18,7 @@ import argparse
 import os, sys, random, logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Sequence, Optional
 
 sys.path.append(Path(__file__).parent.parent.as_posix())
 
@@ -81,9 +81,13 @@ class VLLMTrainer(nn.Module):
         self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
         print(f"LLM hidden size: {self.llm.hidden_size}")
         self.current_epoch = 0
+        self.tau = llm_cfg.get('contrastive_tau', 0.07)
+        self.neg_sample_k = int(llm_cfg.get('contrastive_neg_k', 64))
+        self.contrastive_alpha = float(llm_cfg.get('contrastive_alpha', 0.0))
         # For visualization
         self.last_logits = None
         self.last_labels = None
+        self.scalers = {}
 
     def get_parameter_groups(self) -> List[Dict]:
         """Separate parameters for differential learning rates."""
@@ -100,6 +104,96 @@ class VLLMTrainer(nn.Module):
             {"params": self.visual.parameters(), "lr": visual_lr},
             {"params": self.llm.parameters(), "lr": llm_lr},
         ]
+
+    def get_diverse_loss(
+        self, tokens: torch.Tensor, token_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Encourage diversity among the chunk tokens within a sample."""
+        # tokens: [B, N, P, E], token_mask: [B, N, P]
+        B, N, P, E = tokens.shape
+        pass
+
+    def get_contrastive_loss(
+        self,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+        texts: Sequence[str],
+        tau: float = 0.07,
+    ) -> torch.Tensor:
+        """Encourage similarity between positive pairs and dissimilarity between negative pairs."""
+        # tokens: [B, N, P, E], token_mask: [B, N, P]
+        B, N, P, E = tokens.shape
+        pos_ids = self.llm.get_texts_ids(texts)  # list of [L_i]
+        pos_embeds = [
+            self.llm.get_id_embeddings(ids) for ids in pos_ids
+        ]  # list of [L_i, E]
+        sample_neg_k = self.neg_sample_k
+        neg_embeds = [
+            self.llm.sample_negative_embeddings(sample_neg_k, pos_id).detach()
+            for pos_id in pos_ids
+        ]  # list of [sample_neg_k, E]
+        neg_embeds = torch.stack(neg_embeds, dim=0).to(
+            tokens.device
+        )  # [B, sample_neg_k, E]
+        Lmax = max(pe.shape[0] for pe in pos_embeds)
+        pos_pad = torch.zeros(B, Lmax, E, device=tokens.device)  # [B, Lmax, E]
+        pos_mask = torch.zeros(
+            B, Lmax, dtype=torch.bool, device=tokens.device
+        )  # [B, Lmax]
+        for b, pe in enumerate(pos_embeds):
+            L = pe.shape[0]
+            if L <= 0 or L > Lmax:
+                raise ValueError("Invalid pos_embeds length.")
+            pos_pad[b, :L, :] = pe
+            pos_mask[b, :L] = 1
+
+        C = torch.cat([pos_pad, neg_embeds], dim=1)  # [B, Lmax + sample_neg_k, E]
+        M = C.shape[1]
+        cand_mask = torch.cat(
+            [
+                pos_mask,
+                torch.ones(B, sample_neg_k, dtype=torch.bool, device=tokens.device),
+            ],
+            dim=1,
+        )  # [B, M]
+
+        C = F.normalize(C, dim=-1)
+        Y = tokens[token_mask].reshape(-1, E)  # [sum(B*N*P_valid), E]
+        Y = F.normalize(Y, dim=-1)
+
+        with torch.no_grad():
+            b_grid = (
+                torch.arange(B, device=tokens.device).view(B, 1, 1).expand(B, N, P)
+            )  # [B, N, P]
+            b_idx = b_grid[token_mask].contiguous()  # [sum(B*N*P_valid)]
+
+        loss_list = []
+        start = 0
+
+        for b in range(B):
+            Tb = (b_idx == b).sum().item()  # number of valid tokens for sample b
+            if Tb <= 0:
+                continue
+            Yb = Y[start : start + Tb]  # [Tb, E]
+            start += Tb
+
+            Cb = C[b]  # [M, E]
+            logits = (Yb @ Cb.t()) / tau  # [Tb, M]
+            mask_b = cand_mask[b].unsqueeze(0).expand(logits.shape)  # [Tb, M]
+            logits = logits.masked_fill(~mask_b, float('-inf'))  # 用-inf填充padding位置
+            log_probs = F.log_softmax(logits, dim=-1)  # [Tb, M]
+
+            Lb = pos_mask[b].sum().item()  # length of positive text
+            if Lb <= 0:
+                continue
+            pos_log = log_probs[:, :Lb]  # [Tb, Lb]
+            loss_b = -pos_log.mean()  # average over all tokens and positive texts
+            loss_list.append(loss_b)
+
+        if len(loss_list) == 0:
+            return torch.tensor(0.0, device=tokens.device, requires_grad=True)
+        loss = torch.stack(loss_list).mean()
+        return loss
 
     def forward(self, batch: Dict[str, Any]):
         if not isinstance(batch, dict):
@@ -127,6 +221,10 @@ class VLLMTrainer(nn.Module):
             last_chunk_valid_len=last_chunk_valid_len,
             adjacency=adjacency,
         )
+        # tokens: [B, N, P, E], token_mask: [B, N, P]
+        contrastive_loss = self.get_contrastive_loss(
+            tokens, token_mask, texts, tau=self.tau
+        )
 
         # The llm.forward now returns (outputs, labels)
         output, labels = self.llm(tokens, token_mask, texts)
@@ -136,6 +234,15 @@ class VLLMTrainer(nn.Module):
         self.last_labels = labels
 
         loss = output.loss if hasattr(output, 'loss') else output
+        if loss is None:
+            raise ValueError("LLM forward did not return loss.")
+        self.scalers['LM_loss'] = loss.item()
+        self.scalers['contrastive_loss'] = (
+            contrastive_loss.item() if contrastive_loss is not None else 0.0
+        )
+        if self.contrastive_alpha > 0:
+            loss = loss + self.contrastive_alpha * contrastive_loss
+        self.scalers['total_loss'] = loss.item()
         return loss
 
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -344,7 +451,9 @@ def train(args):
             if hasattr(engine.module, 'current_epoch'):
                 engine.module.current_epoch = global_step
             if writer is not None:
-                writer.add_scalar('train/loss', float(loss.item()), global_step)
+                # writer.add_scalar('train/loss', float(loss.item()), global_step)
+                for k, v in engine.module.scalers.items():
+                    writer.add_scalar(f'train/{k}', float(v), global_step)
                 # Try to log LR
                 try:
                     if hasattr(engine, 'optimizer') and engine.optimizer is not None:

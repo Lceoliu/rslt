@@ -55,6 +55,9 @@ llm:
   eoc_token: "<EOC>"
   bot_token: "<BOT>"
   eot_token: "<EOT>"
+  contrastive_tau: 0.07
+  contrastive_neg_k: 64
+  contrastive_alpha: 0.5
 
 decoding:
   max_new_tokens: 64

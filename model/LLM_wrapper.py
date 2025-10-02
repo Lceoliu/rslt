@@ -65,6 +65,9 @@ class LLMWithVisualPrefix(nn.Module):
         if freeze_lm:
             for param in self.model.parameters():
                 param.requires_grad = False
+            # ensure embeddings are frozen too
+            if hasattr(self.model, "get_input_embeddings"):
+                self.model.get_input_embeddings().weight.requires_grad = False
 
         config = self.model.config
         hidden_size = getattr(config, "hidden_size", None)
@@ -90,7 +93,13 @@ class LLMWithVisualPrefix(nn.Module):
         token_mask: torch.Tensor,
         texts: Sequence[str],
     ):
-        """Compute autoregressive loss given chunk embeddings and texts."""
+        """
+        Compute autoregressive loss given chunk embeddings and texts.
+
+        chunk_tokens: [B, N, P, E], where B is batch size, N is number of chunks, P is tokens per chunk, E is embedding dimension
+        token_mask: [B, N, P] bool
+        texts: List of length B
+        """
 
         if chunk_tokens.dim() != 4:
             raise ValueError("chunk_tokens must be [B, N, P, E].")
@@ -305,6 +314,10 @@ class LLMWithVisualPrefix(nn.Module):
         return ids
 
     def _tokenize_text(self, text: str) -> torch.Tensor:
+        """
+        Input: text string
+        Output: token ids tensor [L]
+        """
         encoded = self.tokenizer(
             text,
             add_special_tokens=False,
@@ -313,6 +326,52 @@ class LLMWithVisualPrefix(nn.Module):
             return_tensors="pt",
         )
         return encoded["input_ids"][0].to(self.device)
+
+    def get_texts_ids(self, texts: Sequence[str]) -> Sequence[torch.Tensor]:
+        """
+        Input: List of text strings
+        Output: List of token ids tensors [L_i]
+        """
+        return [self._tokenize_text(text) for text in texts]
+
+    def get_id_embeddings(
+        self,
+        ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Input: token ids tensor [L]
+        Output: token embeddings tensor [L, E]
+        """
+        embed_layer = self.model.get_input_embeddings()
+        return embed_layer(ids)
+
+    def sample_negative_embeddings(
+        self,
+        num_samples: int,
+        positive_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Sample negative token embeddings from the vocabulary.
+
+        Input: num_samples: number of negative samples to draw
+               positive_ids: tensor of positive token ids [L]
+        Output: token embeddings tensor [num_samples, E]
+        """
+        vocab_size = self.model.config.vocab_size
+        device = self.device
+        dtype = self.model.get_input_embeddings().weight.dtype
+
+        random_ids = torch.randint(0, vocab_size, (num_samples,), device=device)
+
+        negative_ids = random_ids[
+            ~random_ids.unsqueeze(0).isin(positive_ids.unsqueeze(1)).any(0)
+        ]
+        if negative_ids.numel() < num_samples:
+            # If not enough negative samples, fallback to random sampling
+            negative_ids = torch.randint(0, vocab_size, (num_samples,), device=device)
+
+        embeds = self.get_id_embeddings(negative_ids)
+        return embeds.to(dtype)
 
     def _pad_sequences(
         self,
