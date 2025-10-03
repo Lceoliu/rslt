@@ -14,4 +14,4 @@ fi
 deepspeed --num_gpus=8 --master_port=29501 training/train_deepspeed.py \
   --config configs/train_default_stage2.yaml \
   --deepspeed \
-  --deepspeed_config configs/ds_config_bf16_stage2.json
+  --deepspeed_config configs/ds_config_stage2.json

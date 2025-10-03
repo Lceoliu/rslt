@@ -170,7 +170,7 @@ class VLLMTrainer(nn.Module):
         )  # [B, M]
 
         C = F.normalize(C, dim=-1)
-        Y = tokens[token_mask].reshape(-1, E)  # [sum(B*N*P_valid), E]
+        Y = tokens[token_mask].reshape(-1, E).to(C.dtype)  # [sum(B*N*P_valid), E]
         Y = F.normalize(Y, dim=-1)
 
         with torch.no_grad():
@@ -277,7 +277,6 @@ def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
     return (z * 0.0).sum()
 
 
-
 def _sync_param_group_lrs(engine, target_lrs):
     optimizer = getattr(engine, "optimizer", None)
     if optimizer is None:
@@ -369,7 +368,7 @@ def train(args):
     target_lrs = [float(pg.get("lr", 0.0)) for pg in param_groups]
 
     engine, optimizer, _, scheduler = deepspeed.initialize(
-        args=args, model=net, model_parameters=param_groups
+        model=net, model_parameters=param_groups, config=ds_config
     )
     _sync_param_group_lrs(engine, target_lrs)
     device = engine.device
