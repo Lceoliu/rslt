@@ -476,6 +476,25 @@ def train(args):
             global_step = int(client_sd.get('global_step', 0))
             start_epoch = int(client_sd.get('epoch', 0))
 
+    # Manual LR scheduling for differential learning rates
+    def update_learning_rate(step, warmup_steps, total_steps, base_lrs):
+        """Cosine annealing with linear warmup for each param group."""
+        import math
+        lrs = []
+        for base_lr in base_lrs:
+            if step < warmup_steps:
+                # Linear warmup
+                lr = base_lr * (step + 1) / warmup_steps
+            else:
+                # Cosine decay
+                progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+                lr = base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+            lrs.append(lr)
+        return lrs
+
+    warmup_steps = max(1, int(0.05 * total_num_steps))  # 5% warmup
+    base_lrs = target_lrs  # [visual_lr, llm_lr]
+
     for epoch in range(start_epoch, epochs):
         if hasattr(train_loader, 'sampler') and hasattr(
             train_loader.sampler, 'set_epoch'
@@ -488,6 +507,13 @@ def train(args):
         if engine.global_rank == 0 and tqdm is not None:
             iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
         for step, batch in enumerate(iterable):
+            # Update learning rates manually
+            current_lrs = update_learning_rate(global_step, warmup_steps, total_num_steps, base_lrs)
+            if hasattr(engine, 'optimizer') and engine.optimizer is not None:
+                for i, pg in enumerate(engine.optimizer.param_groups):
+                    if i < len(current_lrs):
+                        pg['lr'] = current_lrs[i]
+
             # move tensors to correct device
             if isinstance(batch, dict):
                 batch = {k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}

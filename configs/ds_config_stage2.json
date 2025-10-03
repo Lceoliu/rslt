@@ -20,13 +20,5 @@
 		"overlap_comm": true,
 		"contiguous_gradients": true
 	},
-	"scheduler": {
-		"type": "WarmupDecayLR",
-		"params": {
-			"warmup_min_lr": 0.0,
-			"warmup_num_steps": 0.05,
-			"total_num_steps": "auto"
-		}
-	},
 	"wall_clock_breakdown": false
 }
