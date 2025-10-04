@@ -1,12 +1,16 @@
 train:
   seed: 3407
-  epochs: 12
-  log_logits: true
-  log_interval: 1000
-  val_interval: 200
+  epochs: 32
+  log_logits: false
+  log_interval: 500
+  val_interval: 300
   save_dir_root: runs
-  save_every: 1000
-  resume_from: ""
+  save_every: 1200
+  resume_from: "/workspace/rslt/runs/20251003_125814_resume" # modify this
+  ckpt_tag: "" # specify the checkpoint tag to load, e.g. "global_step1000", or leave it as an empty string to load the latest checkpoint
+  resume_for_new_stage: true # if true, will load model weights but not optimizer, lr_scheduler states
+  visual_lr: 1e-5
+  llm_lr: 5e-7    
 
 dataset:
   data_dir: /2023234331/data/shm/format_data/csl_shm
@@ -17,7 +21,7 @@ dataset:
   aug_speed_max: 1.1
   aug_mask_prob: 0.05
   pad_last: true
-  min_reserved_ratio: 1.0
+  min_reserved_ratio: 0.6
   window: 32
   stride: 16
 
@@ -42,14 +46,14 @@ model:
   chunk_transformer:
     layers: 3
     heads: 8
-    dropout: 0.1
+    dropout: 0.15  # Increased from 0.1 for regularization
     mlp_dim: 512
 
 llm:
   model_name_or_path: /workspace/Qwen
   trust_remote_code: true
   max_text_len: 128
-  freeze_lm: true
+  freeze_lm: false
   gradient_checkpointing: false
   boc_token: "<BOC>"
   eoc_token: "<EOC>"
@@ -57,7 +61,7 @@ llm:
   eot_token: "<EOT>"
   contrastive_tau: 0.07
   contrastive_neg_k: 128
-  contrastive_alpha: 0.75
+  contrastive_alpha: 0.0  # Keep contrastive learning to constrain visual features
 
 decoding:
   max_new_tokens: 64

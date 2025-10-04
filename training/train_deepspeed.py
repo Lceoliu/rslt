@@ -307,6 +307,23 @@ def cast_model(model: nn.Module, dtype: torch.dtype) -> nn.Module:
         model = model.to(torch.float32)
     return model
 
+
+def get_sync_run_id() -> str:
+    run_id = os.environ.get('RUN_ID')
+    if not run_id:
+        # Rank0 creates a run id; broadcast to all
+        run_id = (
+            datetime.now().strftime('%Y%m%d_%H%M%S')
+            if (not dist.is_initialized() or dist.get_rank() == 0)
+            else None
+        )
+        obj = [run_id]
+        if dist.is_initialized():
+            dist.broadcast_object_list(obj, src=0)
+        run_id = obj[0]  # type: ignore
+    return run_id
+
+
 def train(args):
     cfg = load_config(args.config)
     seed = int(cfg.get('train', {}).get('seed', 3407))
@@ -398,14 +415,7 @@ def train(args):
                 raise ValueError(f"resume_from checkpoints dir not found: {ckpt_dir}")
     else:
         base_root = Path(train_cfg.get('save_dir_root', 'runs'))
-        run_id = os.environ.get('RUN_ID')
-        if not run_id:
-            # Rank0 creates a run id; broadcast to all
-            run_id = datetime.now().strftime('%Y%m%d_%H%M%S') if (not dist.is_initialized() or dist.get_rank() == 0) else None
-            obj = [run_id]
-            if dist.is_initialized():
-                dist.broadcast_object_list(obj, src=0)
-            run_id = obj[0]  # type: ignore
+        run_id = get_sync_run_id()
         run_dir = base_root / str(run_id)
         ckpt_dir = run_dir / 'checkpoints'
 
@@ -418,9 +428,7 @@ def train(args):
             run_dir_name = run_dir.name
             run_dir = run_dir.parent / f"{run_dir_name}_resume"
             if run_dir.exists():
-                print(
-                    f"Resuming run, but {run_dir} already exists. New run will be overwritten."
-                )
+                run_dir = run_dir.parent / f"{run_dir_name}_resume_{get_sync_run_id()}"
         run_dir.mkdir(parents=True, exist_ok=True)
         ckpt_dir = ckpt_dir.resolve()
         ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -475,6 +483,11 @@ def train(args):
         if isinstance(client_sd, dict):
             global_step = int(client_sd.get('global_step', 0))
             start_epoch = int(client_sd.get('epoch', 0))
+
+        ckpt_dir = run_dir / 'checkpoints'  # do not overwrite old checkpoints
+
+        if not ckpt_dir.exists():
+            ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Manual LR scheduling for differential learning rates
     def update_learning_rate(step, warmup_steps, total_steps, base_lrs):
