@@ -186,23 +186,51 @@ def main() -> None:
     net.eval()
 
     ckpt_dir = Path(args.checkpoint)
-    try:
-        load_state_dict_from_zero_checkpoint(net, str(ckpt_dir))
-        print(f"Loaded ZeRO checkpoint from {ckpt_dir}")
-    except Exception as exc:
-        print(f"[warn] zero_to_fp32 merge failed: {exc}. Trying raw state dict...")
-        cand = None
-        for name in ["pytorch_model.bin", "model_fp32.pt", "mp_rank_00_model_states.pt"]:
-            candidate = ckpt_dir / name
-            if candidate.exists():
-                cand = candidate
-                break
-        if cand is None:
-            raise RuntimeError(f"No checkpoint file found in {ckpt_dir}")
-        state = torch.load(cand, map_location="cpu")
-        if isinstance(state, dict) and "module" in state:
-            state = state["module"]
+
+    # Try to find checkpoint in subdirectories (e.g., global_step34332/)
+    if not any(ckpt_dir.glob("*.pt")) and not any(ckpt_dir.glob("*.bin")):
+        # Look for subdirectories with global_step pattern
+        subdirs = [d for d in ckpt_dir.iterdir() if d.is_dir() and d.name.startswith("global_step")]
+        if subdirs:
+            # Use the latest checkpoint
+            ckpt_dir = max(subdirs, key=lambda x: int(x.name.replace("global_step", "")))
+            print(f"Found checkpoint in subdirectory: {ckpt_dir}")
+
+    # Try loading model_states.pt directly (single rank DeepSpeed checkpoint)
+    model_states_file = ckpt_dir / "mp_rank_00_model_states.pt"
+    if model_states_file.exists():
+        print(f"Loading model states from {model_states_file}")
+        state = torch.load(model_states_file, map_location="cpu")
+
+        # DeepSpeed saves with 'module' key
+        if isinstance(state, dict):
+            if "module" in state:
+                state = state["module"]
+            elif "model_state_dict" in state:
+                state = state["model_state_dict"]
+
         net.load_state_dict(state, strict=False)
+        print(f"✓ Loaded checkpoint from {model_states_file}")
+    else:
+        # Fallback: try ZeRO checkpoint merge or other formats
+        try:
+            load_state_dict_from_zero_checkpoint(net, str(ckpt_dir))
+            print(f"✓ Loaded ZeRO checkpoint from {ckpt_dir}")
+        except Exception as exc:
+            print(f"[warn] ZeRO checkpoint load failed: {exc}. Trying other formats...")
+            cand = None
+            for name in ["pytorch_model.bin", "model_fp32.pt", "model.pt"]:
+                candidate = ckpt_dir / name
+                if candidate.exists():
+                    cand = candidate
+                    break
+            if cand is None:
+                raise RuntimeError(f"No checkpoint file found in {ckpt_dir}")
+            state = torch.load(cand, map_location="cpu")
+            if isinstance(state, dict) and "module" in state:
+                state = state["module"]
+            net.load_state_dict(state, strict=False)
+            print(f"✓ Loaded checkpoint from {cand}")
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
