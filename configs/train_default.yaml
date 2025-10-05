@@ -1,11 +1,11 @@
 train:
   seed: 3407
-  epochs: 12
-  log_logits: true
+  epochs: 15
+  log_logits: false
   log_interval: 1000
-  val_interval: 200
+  val_interval: 250
   save_dir_root: runs
-  save_every: 1000
+  save_every: 1500
   resume_from: ""
 
 dataset:
@@ -18,11 +18,11 @@ dataset:
   aug_mask_prob: 0.05
   pad_last: true
   min_reserved_ratio: 1.0
-  window: 32
-  stride: 16
+  window: 60
+  stride: 20
 
 data:
-  batch_size: 8
+  batch_size: 4
   num_workers: 4
   conf_threshold: 0.1
   T: 32
@@ -33,7 +33,7 @@ model:
   parts: ["body", "face", "left_hand", "right_hand", "fullbody"]
   drop_conf: true
   part_embed_dim: 256
-  tokens_per_chunk: 10
+  tokens_per_chunk: 15
   uni_gcn:
     proj_dim: 256
     temporal_kernel: 5

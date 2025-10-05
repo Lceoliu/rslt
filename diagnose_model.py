@@ -52,6 +52,9 @@ def load_model_from_checkpoint(checkpoint_dir: Path, config_path: Path):
     print(f"Building model...")
     model = VLLMTrainer(cfg, verbose=False)
     model = cast_model(model, get_cast_type(ds_config))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
 
     # Try loading ZeRO checkpoint first
     ckpt_dir = Path(checkpoint_dir)
@@ -156,11 +159,9 @@ def main():
 
         # Build dataloaders
         print_section("2. Loading Data", log)
-        train_loader, val_loader, test_loader = build_dataloaders(cfg)
+        train_loader, val_loader, _ = build_dataloaders(cfg)
         log(f"✓ Train samples: {len(train_loader.dataset)}")
         log(f"✓ Val samples: {len(val_loader.dataset)}")
-        if test_loader:
-            log(f"✓ Test samples: {len(test_loader.dataset)}")
 
         # === PHASE 1: Quick Checks ===
         print_section("PHASE 1: Quick Data Quality Checks", log)

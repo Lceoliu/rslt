@@ -9,3 +9,4 @@ AGENTS.md
 !tests/test_*.py
 
 runs/
+configs/

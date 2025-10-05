@@ -51,8 +51,8 @@ def analyze_prediction_errors(
         generation_kwargs = {
             'max_new_tokens': 64,
             'do_sample': True,
-            'temperature': 1.0,
-            'top_k': 10,
+            'temperature': 0.25,
+            'top_k': 15,
         }
 
     categories = {
@@ -62,7 +62,8 @@ def analyze_prediction_errors(
         'good': [],             # BLEU-4 >= 20
     }
 
-    bleu_scorer = BLEU(effective_order=True)
+    bleu_scorer1 = BLEU(effective_order=True, max_ngram_order=1)
+    bleu_scorer4 = BLEU(effective_order=True, max_ngram_order=4)
 
     sample_count = 0
 
@@ -101,8 +102,8 @@ def analyze_prediction_errors(
         # Analyze each prediction
         for pred, gt in zip(predictions, texts):
             # Compute BLEU-1 and BLEU-4
-            bleu1_score = bleu_scorer.sentence_score(pred, [gt], max_ngram_order=1).score
-            bleu4_score = bleu_scorer.sentence_score(pred, [gt], max_ngram_order=4).score
+            bleu1_score = bleu_scorer1.sentence_score(pred, [gt]).score
+            bleu4_score = bleu_scorer4.sentence_score(pred, [gt]).score
 
             # Categorize
             if bleu1_score == 0:
