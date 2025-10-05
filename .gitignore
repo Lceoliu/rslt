@@ -4,9 +4,11 @@
 AGENTS.md
 .pytest_cache/
 *.txt
+logs/
 
 !tests/
 !tests/test_*.py
 
 runs/
-configs/
+configs/*.json
+!configs/*.yaml

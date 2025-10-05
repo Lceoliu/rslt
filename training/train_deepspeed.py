@@ -82,6 +82,7 @@ class VLLMTrainer(nn.Module):
         self.tau = llm_cfg.get('contrastive_tau', 0.07)
         self.neg_sample_k = int(llm_cfg.get('contrastive_neg_k', 64))
         self.contrastive_alpha = float(llm_cfg.get('contrastive_alpha', 0.0))
+        self.diversity_alpha = float(llm_cfg.get('diversity_alpha', 0.0))
         # For visualization
         self.last_logits = None
         self.last_labels = None
@@ -120,10 +121,28 @@ class VLLMTrainer(nn.Module):
     def get_diverse_loss(
         self, tokens: torch.Tensor, token_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Encourage diversity among the chunk tokens within a sample."""
+        """Encourage diversity among the chunk tokens by penalizing low variance."""
         # tokens: [B, N, P, E], token_mask: [B, N, P]
         B, N, P, E = tokens.shape
-        pass
+        
+        # Normalize tokens to prevent scale from affecting variance
+        tokens = F.normalize(tokens, p=2, dim=-1)
+        
+        # Apply mask to select only valid tokens
+        valid_tokens = tokens[token_mask]  # [num_valid_tokens, E]
+        
+        if valid_tokens.shape[0] < 2:
+            return torch.tensor(0.0, device=tokens.device)
+
+        # Compute std deviation along the feature dimension
+        std_token = torch.sqrt(valid_tokens.var(dim=0) + 1e-6) # [E]
+        
+        # The loss is the mean of the std deviations, we want to maximize it.
+        # So we return its negative value.
+        # A small std means collapse, which gives a large loss.
+        loss = -std_token.mean()
+        
+        return loss
 
     def get_contrastive_loss(
         self,
@@ -237,7 +256,13 @@ class VLLMTrainer(nn.Module):
         contrastive_loss = (
             self.get_contrastive_loss(tokens, token_mask, texts, tau=self.tau)
             if self.contrastive_alpha > 0
-            else None
+            else torch.tensor(0.0, device=device)
+        )
+
+        diversity_loss = (
+            self.get_diverse_loss(tokens, token_mask)
+            if self.diversity_alpha > 0
+            else torch.tensor(0.0, device=device)
         )
 
         # The llm.forward now returns (outputs, labels)
@@ -251,11 +276,10 @@ class VLLMTrainer(nn.Module):
         if loss is None:
             raise ValueError("LLM forward did not return loss.")
         self.scalers['LM_loss'] = loss.item()
-        self.scalers['contrastive_loss'] = (
-            contrastive_loss.item() if contrastive_loss is not None else 0.0
-        )
-        if self.contrastive_alpha > 0:
-            loss = loss + self.contrastive_alpha * contrastive_loss
+        self.scalers['contrastive_loss'] = contrastive_loss.item()
+        self.scalers['diversity_loss'] = diversity_loss.item()
+
+        loss = loss + self.contrastive_alpha * contrastive_loss + self.diversity_alpha * diversity_loss
         self.scalers['total_loss'] = loss.item()
         return loss
 
