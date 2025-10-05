@@ -11,17 +11,18 @@ Usage:
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from datetime import datetime
 
-sys.path.append(Path(__file__).parent.as_posix())
-
 import torch
-import torch.distributed as dist
+
+try:
+    from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
+except Exception as exc:
+    raise RuntimeError("DeepSpeed not installed. Install via: pip install deepspeed") from exc
 
 from model.config import load_config
-from training.train_deepspeed import VLLMTrainer
+from training.train_deepspeed import VLLMTrainer, cast_model, get_cast_type
 from training.data import build_dataloaders
 
 from metrics import (
@@ -35,55 +36,60 @@ from metrics import (
 
 
 def load_model_from_checkpoint(checkpoint_dir: Path, config_path: Path):
-    """Load model from checkpoint."""
+    """Load model from checkpoint using DeepSpeed's method."""
     print(f"Loading config from: {config_path}")
     cfg = load_config(str(config_path))
 
+    # Load DeepSpeed config
+    ds_config_path = Path(cfg.get("train", {}).get("deepspeed_config", cfg.get("deepspeed_config", "configs/ds_config.json")))
+    if not ds_config_path.exists():
+        raise FileNotFoundError(f"DeepSpeed config not found: {ds_config_path}")
+
+    ds_config = json.loads(ds_config_path.read_text(encoding="utf-8"))
+    ds_config["train_batch_size"] = 1
+    ds_config["gradient_accumulation_steps"] = 1
+
     print(f"Building model...")
     model = VLLMTrainer(cfg, verbose=False)
+    model = cast_model(model, get_cast_type(ds_config))
 
-    # Find checkpoint file
-    ckpt_path = Path(checkpoint_dir)
-    if not ckpt_path.exists():
-        raise ValueError(f"Checkpoint path does not exist: {ckpt_path}")
-
-    # Look for pytorch_model.bin or similar
-    model_files = list(ckpt_path.glob("*.bin")) + list(ckpt_path.glob("*.pt"))
-    if not model_files:
-        # Try to find in subdirectories (DeepSpeed format)
-        model_files = list(ckpt_path.glob("**/pytorch_model.bin"))
-
-    if not model_files:
-        raise ValueError(f"No model checkpoint found in {ckpt_path}")
-
-    # Load the first found checkpoint
-    checkpoint_file = model_files[0]
-    print(f"Loading checkpoint from: {checkpoint_file}")
-
-    state_dict = torch.load(checkpoint_file, map_location='cpu')
-
-    # Handle different checkpoint formats
-    if 'module' in state_dict:
-        state_dict = state_dict['module']
-    elif 'model_state_dict' in state_dict:
-        state_dict = state_dict['model_state_dict']
+    # Try loading ZeRO checkpoint first
+    ckpt_dir = Path(checkpoint_dir)
+    if not ckpt_dir.exists():
+        raise ValueError(f"Checkpoint path does not exist: {ckpt_dir}")
 
     try:
-        model.load_state_dict(state_dict, strict=False)
-        print("Checkpoint loaded successfully!")
-    except Exception as e:
-        print(f"Warning: Could not load checkpoint strictly: {e}")
-        print("Attempting partial load...")
-        model.load_state_dict(state_dict, strict=False)
+        load_state_dict_from_zero_checkpoint(model, str(ckpt_dir))
+        print(f"✓ Loaded ZeRO checkpoint from {ckpt_dir}")
+    except Exception as exc:
+        print(f"[warn] ZeRO checkpoint load failed: {exc}")
+        print("Trying raw state dict...")
+
+        # Try different checkpoint file names
+        cand = None
+        for name in ["pytorch_model.bin", "model_fp32.pt", "mp_rank_00_model_states.pt"]:
+            candidate = ckpt_dir / name
+            if candidate.exists():
+                cand = candidate
+                break
+
+        if cand is None:
+            raise RuntimeError(f"No checkpoint file found in {ckpt_dir}")
+
+        state = torch.load(cand, map_location="cpu")
+        if isinstance(state, dict) and "module" in state:
+            state = state["module"]
+        model.load_state_dict(state, strict=False)
+        print(f"✓ Loaded checkpoint from {cand}")
 
     return model, cfg
 
 
-def print_section(title: str):
+def print_section(title: str, log_fn=print):
     """Print a formatted section header."""
-    print("\n" + "=" * 80)
-    print(f"  {title}")
-    print("=" * 80)
+    log_fn("\n" + "=" * 80)
+    log_fn(f"  {title}")
+    log_fn("=" * 80)
 
 
 def format_dict(d: dict, indent: int = 2) -> str:
@@ -119,108 +125,110 @@ def main():
                         help='Device to use')
     args = parser.parse_args()
 
-    # Redirect output if specified
-    output_file = None
-    if args.output:
-        output_file = open(args.output, 'w', encoding='utf-8')
-        sys.stdout = output_file
+    # Prepare output - collect all lines
+    output_lines = []
+
+    def log(msg: str):
+        """Log to both console and output buffer."""
+        print(msg)
+        output_lines.append(msg)
 
     try:
         # Header
-        print("=" * 80)
-        print("MODEL DIAGNOSIS REPORT")
-        print("=" * 80)
-        print(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Checkpoint: {args.checkpoint}")
-        print(f"Config: {args.config}")
-        print(f"Device: {args.device}")
-        print("=" * 80)
+        log("=" * 80)
+        log("MODEL DIAGNOSIS REPORT")
+        log("=" * 80)
+        log(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        log(f"Checkpoint: {args.checkpoint}")
+        log(f"Config: {args.config}")
+        log(f"Device: {args.device}")
+        log("=" * 80)
 
         # Load model
-        print_section("1. Loading Model")
+        print_section("1. Loading Model", log)
         model, cfg = load_model_from_checkpoint(
             Path(args.checkpoint),
             Path(args.config)
         )
         model = model.to(args.device)
         model.eval()
-        print("✓ Model loaded successfully")
+        log("✓ Model loaded successfully")
 
         # Build dataloaders
-        print_section("2. Loading Data")
+        print_section("2. Loading Data", log)
         train_loader, val_loader, test_loader = build_dataloaders(cfg)
-        print(f"✓ Train samples: {len(train_loader.dataset)}")
-        print(f"✓ Val samples: {len(val_loader.dataset)}")
+        log(f"✓ Train samples: {len(train_loader.dataset)}")
+        log(f"✓ Val samples: {len(val_loader.dataset)}")
         if test_loader:
-            print(f"✓ Test samples: {len(test_loader.dataset)}")
+            log(f"✓ Test samples: {len(test_loader.dataset)}")
 
         # === PHASE 1: Quick Checks ===
-        print_section("PHASE 1: Quick Data Quality Checks")
+        print_section("PHASE 1: Quick Data Quality Checks", log)
 
         # Data quality
-        print("\n[1.1] Dataset Quality Metrics")
-        print("-" * 40)
+        log("\n[1.1] Dataset Quality Metrics")
+        log("-" * 40)
         data_quality = check_data_quality(val_loader.dataset, max_samples=args.max_samples)
-        print(format_dict(data_quality))
+        log(format_dict(data_quality))
 
         # Oracle BLEU
-        print("\n[1.2] Oracle BLEU (Self-Reference Test)")
-        print("-" * 40)
+        log("\n[1.2] Oracle BLEU (Self-Reference Test)")
+        log("-" * 40)
         oracle_results = compute_oracle_bleu(val_loader)
-        print(format_dict(oracle_results))
+        log(format_dict(oracle_results))
         if 'oracle_bleu' in oracle_results:
             if oracle_results['oracle_bleu'] < 99:
-                print("⚠ WARNING: Oracle BLEU should be ~100. Data processing may have bugs!")
+                log("⚠ WARNING: Oracle BLEU should be ~100. Data processing may have bugs!")
 
         # === PHASE 2: Model Behavior Tests ===
-        print_section("PHASE 2: Model Behavior Analysis")
+        print_section("PHASE 2: Model Behavior Analysis", log)
 
         # Visual ablation
-        print("\n[2.1] Visual Information Usage Test")
-        print("-" * 40)
-        print("Testing if LLM actually uses visual input...")
+        log("\n[2.1] Visual Information Usage Test")
+        log("-" * 40)
+        log("Testing if LLM actually uses visual input...")
         ablation_results = test_visual_importance(model, val_loader, max_samples=args.max_samples // 2)
-        print(format_dict(ablation_results))
+        log(format_dict(ablation_results))
 
         if 'delta_normal_random' in ablation_results:
             delta = ablation_results['delta_normal_random']
             if delta < 0.5:
-                print("❌ CRITICAL: LLM barely uses visual input! (Δ < 0.5)")
+                log("❌ CRITICAL: LLM barely uses visual input! (Δ < 0.5)")
             elif delta < 2.0:
-                print("⚠ WARNING: LLM partially uses visual input (Δ < 2.0)")
+                log("⚠ WARNING: LLM partially uses visual input (Δ < 2.0)")
             else:
-                print("✓ GOOD: LLM strongly relies on visual input (Δ >= 2.0)")
+                log("✓ GOOD: LLM strongly relies on visual input (Δ >= 2.0)")
 
         # Special tokens
-        print("\n[2.2] Special Token Analysis")
-        print("-" * 40)
+        log("\n[2.2] Special Token Analysis")
+        log("-" * 40)
         token_results = analyze_special_tokens(model)
-        print(format_dict(token_results))
+        log(format_dict(token_results))
 
         # === PHASE 3: Feature Quality ===
-        print_section("PHASE 3: Visual Feature Quality")
+        print_section("PHASE 3: Visual Feature Quality", log)
 
-        print("\n[3.1] Visual-Text Retrieval Accuracy")
-        print("-" * 40)
-        print("Testing if visual features can retrieve correct text...")
+        log("\n[3.1] Visual-Text Retrieval Accuracy")
+        log("-" * 40)
+        log("Testing if visual features can retrieve correct text...")
         retrieval_results = compute_retrieval_metrics(model, val_loader, max_samples=args.max_samples)
-        print(format_dict(retrieval_results))
+        log(format_dict(retrieval_results))
 
         if 'retrieval_r@1' in retrieval_results:
             r1 = retrieval_results['retrieval_r@1']
             if r1 < 10:
-                print("❌ CRITICAL: Visual features have no semantic meaning (R@1 < 10%)")
+                log("❌ CRITICAL: Visual features have no semantic meaning (R@1 < 10%)")
             elif r1 < 30:
-                print("⚠ WARNING: Visual features are weak (R@1 < 30%)")
+                log("⚠ WARNING: Visual features are weak (R@1 < 30%)")
             else:
-                print("✓ GOOD: Visual features have good quality (R@1 >= 30%)")
+                log("✓ GOOD: Visual features have good quality (R@1 >= 30%)")
 
         # === PHASE 4: Error Analysis ===
-        print_section("PHASE 4: Prediction Error Analysis")
+        print_section("PHASE 4: Prediction Error Analysis", log)
 
-        print("\n[4.1] Error Pattern Classification")
-        print("-" * 40)
-        print("Analyzing prediction errors...")
+        log("\n[4.1] Error Pattern Classification")
+        log("-" * 40)
+        log("Analyzing prediction errors...")
         error_results = analyze_prediction_errors(
             model, val_loader,
             max_samples=args.max_samples,
@@ -235,7 +243,7 @@ def main():
         # Print statistics
         if 'total_samples' in error_results:
             total = error_results['total_samples']
-            print(f"\nTotal samples analyzed: {total}\n")
+            log(f"\nTotal samples analyzed: {total}\n")
 
             categories = ['total_fail', 'keyword_only', 'partial_correct', 'good']
             for cat in categories:
@@ -244,22 +252,22 @@ def main():
                 if count_key in error_results:
                     count = error_results[count_key]
                     ratio = error_results[ratio_key]
-                    print(f"{cat:20s}: {count:4d} ({ratio:5.1f}%)")
+                    log(f"{cat:20s}: {count:4d} ({ratio:5.1f}%)")
 
             # Print examples
-            print("\nExample Errors:")
+            log("\nExample Errors:")
             for cat in categories:
                 examples_key = f'{cat}_examples'
                 if examples_key in error_results and error_results[examples_key]:
-                    print(f"\n--- {cat.upper()} Examples ---")
+                    log(f"\n--- {cat.upper()} Examples ---")
                     for i, ex in enumerate(error_results[examples_key][:2], 1):
-                        print(f"  Example {i}:")
-                        print(f"    GT:   {ex['ground_truth']}")
-                        print(f"    Pred: {ex['prediction']}")
-                        print(f"    BLEU: {ex['bleu1']:.1f} / {ex['bleu4']:.1f}")
+                        log(f"  Example {i}:")
+                        log(f"    GT:   {ex['ground_truth']}")
+                        log(f"    Pred: {ex['prediction']}")
+                        log(f"    BLEU: {ex['bleu1']:.1f} / {ex['bleu4']:.1f}")
 
         # === SUMMARY ===
-        print_section("DIAGNOSTIC SUMMARY")
+        print_section("DIAGNOSTIC SUMMARY", log)
 
         issues = []
         recommendations = []
@@ -289,25 +297,38 @@ def main():
             recommendations.append("Consider using a larger LLM")
 
         if issues:
-            print("\n⚠ CRITICAL ISSUES FOUND:")
+            log("\n⚠ CRITICAL ISSUES FOUND:")
             for i, issue in enumerate(issues, 1):
-                print(f"  {i}. {issue}")
+                log(f"  {i}. {issue}")
 
-            print("\n💡 RECOMMENDATIONS:")
+            log("\n💡 RECOMMENDATIONS:")
             for i, rec in enumerate(recommendations, 1):
-                print(f"  {i}. {rec}")
+                log(f"  {i}. {rec}")
         else:
-            print("\n✓ No critical issues detected. Model appears healthy!")
+            log("\n✓ No critical issues detected. Model appears healthy!")
 
-        print("\n" + "=" * 80)
-        print("END OF REPORT")
-        print("=" * 80)
+        log("\n" + "=" * 80)
+        log("END OF REPORT")
+        log("=" * 80)
 
-    finally:
-        if output_file:
-            output_file.close()
-            sys.stdout = sys.__stdout__
-            print(f"Report saved to: {args.output}")
+        # Write to file if specified
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(output_lines))
+            print(f"\n✓ Report saved to: {args.output}")
+
+    except Exception as e:
+        error_msg = f"\n❌ Error during diagnosis: {e}"
+        print(error_msg)
+        if args.output:
+            output_lines.append(error_msg)
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(output_lines))
+        raise
 
 
 if __name__ == '__main__':
