@@ -249,10 +249,10 @@ def main() -> None:
             gt_text=gt_text,
         )
         key = f"{args.split}_batch{idx}"
-
-        with open(out_dir / "partial.txt", "a", encoding="utf-8") as f:
-            f.write(f"=== Sample {key} ===\n")
-            f.write(result["logits_visualization"])
+        if result.get("logits_visualization") is not None:
+            with open(out_dir / "partial.txt", "a", encoding="utf-8") as f:
+                f.write(f"=== Sample {key} ===\n")
+                f.write(result["logits_visualization"])
         result.pop("logits_visualization", None)
         results[key] = result
         (out_dir / "partial.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
