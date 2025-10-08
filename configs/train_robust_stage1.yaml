@@ -42,7 +42,7 @@ model:
   tokens_per_chunk: 16
   uni_gcn:
     proj_dim: 256
-    temporal_kernel: 8
+    temporal_kernel: 7
     adaptive: true
     dropout: 0.1 # 略微增加GCN的dropout
   chunk_transformer:

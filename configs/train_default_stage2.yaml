@@ -1,32 +1,32 @@
 train:
   seed: 3407
-  epochs: 20
+  epochs: 40
   log_logits: false
-  log_interval: 500
-  val_interval: 250
+  log_interval: 1000
+  val_interval: 600
   save_dir_root: runs
   save_every: 1200
-  resume_from: "/workspace/rslt/runs/20251003_125814" # modify this
+  resume_from: "/workspace/rslt/runs/robust/20251006_065837/checkpoints" # modify this
   ckpt_tag: "" # specify the checkpoint tag to load, e.g. "global_step1000", or leave it as an empty string to load the latest checkpoint
   resume_for_new_stage: true # if true, will load model weights but not optimizer, lr_scheduler states
   visual_lr: 5e-5  # Keep Stage 1 LR - visual encoder should keep improving
-  llm_lr: 5e-8     # Very small LR (1000x smaller) - LLM only does light adaptation
+  llm_lr: 1e-7     # Very small LR (1000x smaller) - LLM only does light adaptation
 
 dataset:
   data_dir: /2023234331/data/shm/format_data/csl_shm
   seed: 3407
-  augmentations: ""
-  aug_prob: 0.0
+  augmentations: "speed"
+  aug_prob: 0.3
   aug_speed_min: 0.9
   aug_speed_max: 1.1
   aug_mask_prob: 0.05
   pad_last: true
   min_reserved_ratio: 0.75
-  window: 32
-  stride: 16
+  window: 60
+  stride: 20
 
 data:
-  batch_size: 8
+  batch_size: 4
   num_workers: 4
   conf_threshold: 0.1
   T: 32
@@ -37,16 +37,16 @@ model:
   parts: ["body", "face", "left_hand", "right_hand", "fullbody"]
   drop_conf: true
   part_embed_dim: 256
-  tokens_per_chunk: 10
+  tokens_per_chunk: 16
   uni_gcn:
     proj_dim: 256
-    temporal_kernel: 5
+    temporal_kernel: 7
     adaptive: true
-    dropout: 0.0
+    dropout: 0.1
   chunk_transformer:
-    layers: 3
+    layers: 5
     heads: 8
-    dropout: 0.15  # Increased from 0.1 for regularization
+    dropout: 0.2  # Increased from 0.1 for regularization
     mlp_dim: 512
 
 llm:
@@ -62,6 +62,7 @@ llm:
   contrastive_tau: 0.07
   contrastive_neg_k: 128
   contrastive_alpha: 0.1  # Keep contrastive learning to constrain visual features
+  diversity_alpha: 0.1
 
 decoding:
   max_new_tokens: 64

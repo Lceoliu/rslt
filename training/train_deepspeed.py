@@ -478,9 +478,9 @@ def train(args):
         logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler(log_path, encoding='utf-8')])
 
     epochs = int(train_cfg.get('epochs', args.epochs))
-    log_interval = int(train_cfg.get('log_interval', 10))
+    log_interval = int(train_cfg.get('log_interval', 1000))
     log_logits = bool(train_cfg.get('log_logits', True))
-    val_interval = int(train_cfg.get('val_interval', 100))
+    val_interval = int(train_cfg.get('val_interval', 500))
     save_every = int(train_cfg.get('save_every', 0))  # 0 disables periodic save
     ckpt_tag = str(train_cfg.get('ckpt_tag', None)).strip()
     resume_for_new_stage = bool(train_cfg.get('resume_for_new_stage', False))
@@ -531,6 +531,8 @@ def train(args):
 
     warmup_steps = max(1, int(0.05 * total_num_steps))  # 5% warmup
     base_lrs = target_lrs  # [visual_lr, llm_lr]
+
+    min_val_loss = float('inf')
 
     for epoch in range(start_epoch, epochs):
         if hasattr(train_loader, 'sampler') and hasattr(
@@ -620,13 +622,29 @@ def train(args):
 
             # Periodic checkpointing on all ranks
             if save_every > 0 and (global_step % save_every == 0) and global_step > 0:
-                engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epoch})
+                engine.save_checkpoint(
+                    str(ckpt_dir),
+                    client_state={'global_step': global_step, 'epoch': epoch},
+                )
             if global_step % val_interval == 0 and global_step > 0:
                 eval_stat = evaluate(engine, val_loader)
+                val_loss = float(eval_stat)
+                if val_loss < min_val_loss:
+                    min_val_loss = val_loss
+                    # Save best checkpoint
+                    engine.save_checkpoint(
+                        str(ckpt_dir),
+                        tag='best',
+                        client_state={'global_step': global_step, 'epoch': epoch},
+                    )
+                    print(
+                        f"  [info] New best model saved at step {global_step} with val_loss={val_loss:.6f}"
+                    )
                 if engine.global_rank == 0:
                     if writer is not None:
                         writer.add_scalar('val/loss', float(eval_stat), global_step)
                     print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
+
                     # Sample a few predictions for inspection
                     try:
                         sample_and_log_predictions(engine, val_loader, cfg, global_step, writer)

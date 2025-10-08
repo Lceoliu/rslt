@@ -4,6 +4,7 @@ from pathlib import Path
 import pdb
 from typing import Any, Dict, List
 import torch.nn.functional as F
+from tqdm import tqdm
 
 import torch
 
@@ -35,7 +36,7 @@ def _build_test_loader(cfg: Dict[str, Any], split: str = "test") -> Any:
         shuffle=False,
         num_workers=int(cfg.get("data", {}).get("num_workers", 0)),
         pin_memory=True,
-        verbose=True,
+        verbose=False,
     )
     return loader
 
@@ -179,7 +180,7 @@ def main() -> None:
     max_new_tokens = int(args.max_new_tokens) if args.max_new_tokens is not None else int(dec_cfg.get("max_new_tokens", 48))
     do_sample = bool(args.do_sample or dec_cfg.get("do_sample", False))
 
-    net = VLLMTrainer(cfg, verbose=True)
+    net = VLLMTrainer(cfg, verbose=False)
     net = cast_model(net, get_cast_type(ds_config))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net.to(device)
@@ -237,7 +238,7 @@ def main() -> None:
 
     loader = _build_test_loader(cfg, split=args.split)
     results: Dict[str, Any] = {}
-    for idx, batch in enumerate(loader):
+    for idx, batch in enumerate(tqdm(loader, desc="Inference")):
         gt_text = batch.get("text", [None])[0]
         result = predict_for_sample(
             net,
