@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 import torch
+import numpy as np
 
 try:
     import deepspeed  # type: ignore
@@ -16,7 +17,7 @@ except Exception as exc:
 
 from model.config import load_config
 from training.train_deepspeed import VLLMTrainer, cast_model, get_cast_type
-from training.utils import set_seed
+from training.utils import set_seed, compute_cosine_similarity, plot_similarity
 
 
 def _build_test_loader(cfg: Dict[str, Any], split: str = "test") -> Any:
@@ -51,6 +52,7 @@ def predict_for_sample(
     temperature: float,
     top_k: int,
     gt_text: str = None,
+    save_path: str = None,
 ) -> Dict[str, Any]:
     device = next(module.parameters()).device
     pose = batch["pose"].to(device)
@@ -66,6 +68,10 @@ def predict_for_sample(
         pose_len=pose_len,
         adjacency=adjacency,
     )
+    if save_path is not None:
+        S_all, flat_to_cti, Xn = compute_cosine_similarity(tokens, token_mask)
+        plot_similarity(S_all, token_mask, save_path)
+
     loss = 0.0
     log_text = None
     if gt_text is not None:
@@ -162,6 +168,14 @@ def main() -> None:
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--do_sample", action="store_true")
     parser.add_argument("--seed", type=int, default=3407)
+    parser.add_argument(
+        "--save_similarity",
+        action="store_true",
+        help="Whether to save similarity plots",
+    )
+    parser.add_argument(
+        "--sim_count", type=int, default=15, help="Number of similarity plots to save"
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -238,8 +252,20 @@ def main() -> None:
 
     loader = _build_test_loader(cfg, split=args.split)
     results: Dict[str, Any] = {}
+    randomly_selected_indices = set()
+    if args.save_similarity:
+        randomly_selected_indices = set(
+            np.random.choice(len(loader), size=args.sim_count, replace=False)
+        )
+        print(
+            f"Randomly selected indices for similarity plots: {sorted(randomly_selected_indices)}"
+        )
     for idx, batch in enumerate(tqdm(loader, desc="Inference")):
         gt_text = batch.get("text", [None])[0]
+        if args.save_similarity and idx in randomly_selected_indices:
+            save_path = out_dir / f"similarity_{idx:04d}.png"
+        else:
+            save_path = None
         result = predict_for_sample(
             net,
             batch,
@@ -248,6 +274,7 @@ def main() -> None:
             temperature=temperature,
             top_k=top_k,
             gt_text=gt_text,
+            save_path=save_path,
         )
         key = f"{args.split}_batch{idx}"
         if result.get("logits_visualization") is not None:
