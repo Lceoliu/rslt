@@ -4,7 +4,7 @@ train:
   log_logits: false
   log_interval: 1000
   val_interval: 400
-  save_dir_root: runs/robust
+  save_dir_root: runs/new
   save_every: 1000
   resume_from: ''
 
@@ -19,11 +19,11 @@ dataset:
   aug_mask_prob: 0.15
   pad_last: true
   min_reserved_ratio: 1.0
-  window: 60
-  stride: 20
+  window: 30
+  stride: 30
 
 data:
-  batch_size: 4
+  batch_size: 8
   num_workers: 4
   conf_threshold: 0.1
   T: 32
@@ -39,7 +39,7 @@ model:
   - fullbody
   drop_conf: true
   part_embed_dim: 256
-  tokens_per_chunk: 16
+  tokens_per_chunk: 12
   uni_gcn:
     proj_dim: 256
     temporal_kernel: 7
@@ -48,7 +48,7 @@ model:
   chunk_transformer:
     layers: 5
     heads: 8
-    dropout: 0.2 # 增加Transformer的dropout
+    dropout: 0.15 # 增加Transformer的dropout
     mlp_dim: 512
 
 llm:
@@ -64,11 +64,11 @@ llm:
   contrastive_tau: 0.07
   contrastive_neg_k: 128
   # --- 关键改动：同时使用对比损失和多样性损失 ---
-  contrastive_alpha: 1.0 # 强化对比损失，使其成为主要驱动力
+  contrastive_alpha: 1.2 # 强化对比损失，使其成为主要驱动力
   diversity_alpha: 0.5   # 引入多样性损失，对抗坍塌
 
 decoding:
   max_new_tokens: 64
   do_sample: true
   temperature: 0.3
-  top_k: 10
+  top_k: 15
