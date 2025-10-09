@@ -46,7 +46,8 @@ from model.config import load_config
 from model.embedding import build_visual_encoder
 from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
-from training.utils import set_seed, log_logits
+from training.utils import set_seed, log_logits, compute_cosine_similarity
+from metrics import bleu_report, rouge_report
 
 
 class VLLMTrainer(nn.Module):
@@ -56,6 +57,7 @@ class VLLMTrainer(nn.Module):
         super().__init__()
         self.cfg = cfg
         llm_cfg = cfg.get('llm', {})
+        self.llm_cfg = llm_cfg
         model_name = llm_cfg.get(
             'model_name_or_path', '../Qwen/Qwen2.5-0.5B'
         )  # default to Qwen2.5-0.5B
@@ -124,24 +126,24 @@ class VLLMTrainer(nn.Module):
         """Encourage diversity among the chunk tokens by penalizing low variance."""
         # tokens: [B, N, P, E], token_mask: [B, N, P]
         B, N, P, E = tokens.shape
-        
+
         # Normalize tokens to prevent scale from affecting variance
         tokens = F.normalize(tokens, p=2, dim=-1)
-        
+
         # Apply mask to select only valid tokens
         valid_tokens = tokens[token_mask]  # [num_valid_tokens, E]
-        
+
         if valid_tokens.shape[0] < 2:
             return torch.tensor(0.0, device=tokens.device)
 
         # Compute std deviation along the feature dimension
         std_token = torch.sqrt(valid_tokens.var(dim=0) + 1e-6) # [E]
-        
+
         # The loss is the mean of the std deviations, we want to maximize it.
         # So we return its negative value.
         # A small std means collapse, which gives a large loss.
         loss = -std_token.mean()
-        
+
         return loss
 
     def get_contrastive_loss(
@@ -283,6 +285,47 @@ class VLLMTrainer(nn.Module):
         self.scalers['total_loss'] = loss.item()
         return loss
 
+    @torch.no_grad()
+    def generate(self, batch: Dict[str, Any]) -> List[str]:
+        self.visual.eval()
+        self.llm.eval()
+        pose = batch['pose']
+        part_lens = batch['part_lens']
+        adjacency = batch['adjacency_matrix']
+        texts = batch.get('text')
+        pose_len = batch.get('pose_len')
+        last_chunk_valid_len = batch.get('last_chunk_valid_len')
+
+        device = next(self.visual.parameters()).device
+        pose = pose.to(device)
+        pose_len = pose_len.to(device) if pose_len is not None else None
+        last_chunk_valid_len = (
+            last_chunk_valid_len.to(device)
+            if last_chunk_valid_len is not None
+            else None
+        )
+        adjacency = {k: v.to(device) for k, v in adjacency.items()}
+
+        tokens, token_mask, _ = self.visual(
+            pose,
+            part_lens=part_lens,
+            pose_len=pose_len,
+            last_chunk_valid_len=last_chunk_valid_len,
+            adjacency=adjacency,
+        )
+
+        predictions = self.llm.generate(
+            tokens,
+            token_mask,
+            max_new_tokens=self.llm_cfg.get('max_new_tokens', 64),
+            do_sample=self.llm_cfg.get('do_sample', True),
+            temperature=self.llm_cfg.get('temperature', 0.3),
+            top_k=self.llm_cfg.get('top_k', 15),
+        )
+
+        return predictions
+
+
 def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in b.items():
         if isinstance(v, dict) and isinstance(a.get(k), dict):
@@ -290,16 +333,6 @@ def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         else:
             a[k] = v
     return a
-
-def _make_dummy_loss(z: torch.Tensor, mode: str = 'none') -> torch.Tensor:
-    """Return a placeholder loss for pipeline verification.
-    - 'none': zero loss but keeps graph: (z * 0).sum()
-    - 'l2': small L2 to exercise backward: 1e-6 * (z ** 2).mean()
-    """
-    if mode == 'l2':
-        return 1e-6 * (z ** 2).mean()
-    return (z * 0.0).sum()
-
 
 def _sync_param_group_lrs(engine, target_lrs):
     optimizer = getattr(engine, "optimizer", None)
@@ -315,6 +348,7 @@ def _sync_param_group_lrs(engine, target_lrs):
         if sched_groups:
             for group, lr in zip(sched_groups, target_lrs):
                 group["initial_lr"] = lr
+
 def get_cast_type(ds_config: Dict[str, Any]) -> torch.dtype:
     if 'bf16' in ds_config and ds_config['bf16'].get('enabled', False):
         return torch.bfloat16
@@ -331,7 +365,6 @@ def cast_model(model: nn.Module, dtype: torch.dtype) -> nn.Module:
         model = model.to(torch.float32)
     return model
 
-
 def get_sync_run_id() -> str:
     run_id = os.environ.get('RUN_ID')
     if not run_id:
@@ -346,7 +379,6 @@ def get_sync_run_id() -> str:
             dist.broadcast_object_list(obj, src=0)
         run_id = obj[0]  # type: ignore
     return run_id
-
 
 def train(args):
     cfg = load_config(args.config)
@@ -365,7 +397,12 @@ def train(args):
     cfg.setdefault('data', {})
     cfg['data']['batch_size'] = micro_bs
 
-    # Build dataloaders after alignment
+    local_rank = args.local_rank
+    if not args.deepspeed:
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    if dist.is_initialized():
+        local_rank = dist.get_rank()
+
     train_loader, val_loader, _ = build_dataloaders(cfg)
 
     # Infer total optimizer steps for scheduler, if provided
@@ -387,7 +424,6 @@ def train(args):
         if isinstance(wms, float) and wms > 0.0 and wms < 1.0:
             params['warmup_num_steps'] = max(1, int(round(wms * total_num_steps)))
         elif isinstance(wms, int):
-            # keep as is
             pass
         else:
             # default to 5% if unspecified or invalid
@@ -397,14 +433,16 @@ def train(args):
         elif 'total_num_steps' not in params:
             params['total_num_steps'] = total_num_steps
 
-    # Build composite trainer module (visual encoder + LLM)
     net = VLLMTrainer(cfg)
-    print(f"Model built. Total params: {sum(p.numel() for p in net.parameters()):,}")
+    if local_rank == 0:
+        print(
+            f"Model built. Total params: {sum(p.numel() for p in net.parameters()):,}"
+        )
 
     net = cast_model(net, get_cast_type(ds_config))
-    print(f"Model cast to {next(net.parameters()).dtype}.")
+    if local_rank == 0:
+        print(f"Model cast to {next(net.parameters()).dtype}.")
 
-    # Get parameter groups for differential learning rates
     param_groups = net.get_parameter_groups()
     target_lrs = [float(pg.get("lr", 0.0)) for pg in param_groups]
 
@@ -412,13 +450,13 @@ def train(args):
         model=net, model_parameters=param_groups, config=ds_config
     )
     _sync_param_group_lrs(engine, target_lrs)
+    local_rank = engine.local_rank
     device = engine.device
     print(
         f"DeepSpeed engine initialized. Local rank: {engine.local_rank}, Global rank: {engine.global_rank}"
     )
     net.to(device)
 
-    # Resolve run/ckpt directories (support resume) with consistent RUN_ID across ranks
     train_cfg = cfg.get('train', {})
     resume_from = train_cfg.get('resume_from', '')
     run_dir = None
@@ -465,15 +503,13 @@ def train(args):
     writer = None
     if engine.global_rank == 0 and SummaryWriter is not None:
         writer = SummaryWriter(log_dir=str(run_dir))
-        # Save a copy of config for reproducibility
         try:
-            import yaml  # type: ignore
+            import yaml
 
             with open(run_dir / 'config_used.yaml', 'w', encoding='utf-8') as f:
                 yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
         except Exception:
             pass
-        # Setup simple file logger for val samples
         log_path = run_dir / 'val_samples.log'
         logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler(log_path, encoding='utf-8')])
 
@@ -485,7 +521,6 @@ def train(args):
     ckpt_tag = str(train_cfg.get('ckpt_tag', None)).strip()
     resume_for_new_stage = bool(train_cfg.get('resume_for_new_stage', False))
 
-    # Optionally resume engine state
     global_step = 0
     start_epoch = 0
     if resume_from:
@@ -566,7 +601,6 @@ def train(args):
             if hasattr(engine.module, 'current_epoch'):
                 engine.module.current_epoch = global_step
             if writer is not None:
-                # writer.add_scalar('train/loss', float(loss.item()), global_step)
                 for k, v in engine.module.scalers.items():
                     writer.add_scalar(f'train/{k}', float(v), global_step)
                 # Try to log LR
@@ -627,7 +661,7 @@ def train(args):
                     client_state={'global_step': global_step, 'epoch': epoch},
                 )
             if global_step % val_interval == 0 and global_step > 0:
-                eval_stat = evaluate(engine, val_loader)
+                eval_stat, score_dict = evaluate(engine, val_loader)
                 val_loss = float(eval_stat)
                 if val_loss < min_val_loss:
                     min_val_loss = val_loss
@@ -643,6 +677,10 @@ def train(args):
                 if engine.global_rank == 0:
                     if writer is not None:
                         writer.add_scalar('val/loss', float(eval_stat), global_step)
+                        for metric, score in score_dict.items():
+                            writer.add_scalar(
+                                f'val/{metric}', float(score), global_step
+                            )
                     print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
 
                     # Sample a few predictions for inspection
@@ -651,7 +689,7 @@ def train(args):
                     except Exception as e:
                         print(f"[warn] sample_and_log_predictions failed: {e}")
 
-    eval_stat = evaluate(engine, val_loader)
+    eval_stat, score_dict = evaluate(engine, val_loader)
     if engine.global_rank == 0:
         if writer is not None:
             writer.add_scalar('val/final_loss', float(eval_stat), global_step)
@@ -662,10 +700,14 @@ def train(args):
 
 
 @torch.no_grad()
-def evaluate(engine, loader: DataLoader) -> float:
+def evaluate(engine, loader: DataLoader) -> Tuple[float, Dict[str, float]]:
     engine.eval()
     local_sum = 0.0
     local_count = 0
+    local_bleu1 = 0.0
+    local_rouge1 = 0.0
+    local_bleu4 = 0.0
+    local_rougeL = 0.0
     for batch in loader:
         # move tensors to device
         if isinstance(batch, dict):
@@ -673,17 +715,73 @@ def evaluate(engine, loader: DataLoader) -> float:
         elif isinstance(batch, (tuple, list)):
             batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
         loss = engine(batch)
+        predictions = engine.module.generate(batch)
+        gt_texts = batch.get('text', [''] * len(predictions))
+        # Compute BLEU and ROUGE for logging
+        b1s = []
+        r1s = []
+        b4s = []
+        rls = []
+        for gt, pred in zip(gt_texts, predictions):
+            b1 = bleu_report.bleu_score(gt, pred, max_n=1)
+            b4 = bleu_report.bleu_score(gt, pred, max_n=4)
+            rl = rouge_report.rouge_l(gt, pred)
+            r1 = rouge_report.rouge_n(gt, pred, n=1)
+            b1s.append(b1)
+            b4s.append(b4)
+            r1s.append(r1)
+            rls.append(rl)
+        avg_b1 = sum(b1s) / len(b1s) if b1s else 0.0
+        avg_b4 = sum(b4s) / len(b4s) if b4s else 0.0
+        avg_r1 = sum(r1s) / len(r1s) if r1s else 0.0
+        avg_rl = sum(rls) / len(rls) if rls else 0.0
+        local_bleu1 += avg_b1
+        local_bleu4 += avg_b4
+        local_rouge1 += avg_r1
+        local_rougeL += avg_rl
+
         local_sum += float(loss.item())
         local_count += 1
     # Aggregate across ranks to avoid desync
     if dist.is_initialized():
-        buf = torch.tensor([local_sum, local_count], device=engine.device, dtype=torch.float64)
+        buf = torch.tensor(
+            [
+                local_sum,
+                local_count,
+                local_bleu1,
+                local_bleu4,
+                local_rouge1,
+                local_rougeL,
+            ],
+            device=engine.device,
+            dtype=torch.float64,
+        )
         dist.all_reduce(buf, op=ReduceOp.SUM)
         total_sum = buf[0].item()
         total_count = max(1.0, buf[1].item())
-        return float(total_sum / total_count)
+        total_bleu1 = buf[2].item()
+        total_bleu4 = buf[3].item()
+        total_rouge1 = buf[4].item()
+        total_rougeL = buf[5].item()
+        if dist.get_rank() == 0:
+            print(
+                f"  [eval] val_loss={total_sum / total_count:.6f} BLEU-1={total_bleu1 / total_count:.4f} BLEU-4={total_bleu4 / total_count:.4f} ROUGE-1={total_rouge1 / total_count:.4f} ROUGE-L={total_rougeL / total_count:.4f}"
+            )
+        dic = {
+            'BLEU-1': total_bleu1 / total_count,
+            'BLEU-4': total_bleu4 / total_count,
+            'ROUGE-1': total_rouge1 / total_count,
+            'ROUGE-L': total_rougeL / total_count,
+        }
+        return float(total_sum / total_count), dic
     else:
-        return float(local_sum / max(1, local_count))
+        dic = {
+            'BLEU-1': local_bleu1 / max(1, local_count),
+            'BLEU-4': local_bleu4 / max(1, local_count),
+            'ROUGE-1': local_rouge1 / max(1, local_count),
+            'ROUGE-L': local_rougeL / max(1, local_count),
+        }
+        return float(local_sum / max(1, local_count)), dic
 
 
 @torch.no_grad()
@@ -710,31 +808,8 @@ def sample_and_log_predictions(
                 b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b
                 for b in batch
             ]
-        pose = batch['pose']
-        part_lens = batch['part_lens']
-        adjacency = batch['adjacency_matrix']
-        texts = batch.get('text')
-        pose_len = batch.get('pose_len')
-        if texts is None:
-            continue
-        device = next(engine.module.visual.parameters()).device
-        pose = pose.to(device)
-        pose_len = pose_len.to(device) if pose_len is not None else None
-        adjacency = {k: v.to(device) for k, v in adjacency.items()}
-        tokens, token_mask, _ = engine.module.visual(
-            pose,
-            part_lens=part_lens,
-            pose_len=pose_len,
-            adjacency=adjacency,
-        )
-        res = engine.module.llm.generate(
-            tokens,
-            token_mask,
-            max_new_tokens=64,
-            do_sample=True,
-            temperature=1.0,
-            top_k=10,
-        )
+        texts = batch.get('text', [''] * batch['pose'].size(0))
+        res = engine.module.generate(batch)
         for i in range(len(texts)):
             pred = res[i]
             gt = texts[i]
