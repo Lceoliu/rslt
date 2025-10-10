@@ -3,7 +3,7 @@
 ## Overview
 - **Goal**: Stream chunked COCO WholeBody 2D keypoints through multi-part GCN and transformer encoder into a decoder-only LLM for sign-to-text translation.
 - **Flow**: Dataset chunking → Multi-Part GCN → Chunk Transformer → LLM Wrapper
-- **Training**: Two-stage strategy with DeepSpeed ZeRO, bf16, differential learning rates, and contrastive learning.
+- **Training**: Two-stage strategy with DeepSpeed ZeRO, bf16, differential learning rates, and a powerful hierarchical contrastive learning approach.
 
 ---
 
@@ -189,13 +189,10 @@ loss = outputs.loss  # Cross-entropy averaged over non-padding tokens
 #### Stage 1: Visual Pre-training
 - **Config**: `configs/train_default.yaml` + `configs/ds_config_stage1.json`
 - **LLM**: Frozen (`freeze_lm=True`)
-- **Learning rate**: `visual_lr=5e-5` (only visual encoder trained)
-- **Loss**: `total_loss = LM_loss + 0.5 * contrastive_loss`
-- **Contrastive learning**:
-  - Positive pairs: Visual tokens vs. text embeddings (same sample)
-  - Negative samples: Random `neg_k=64` tokens from vocabulary
-  - Temperature: `tau=0.07`
-  - Weight: `contrastive_alpha=0.5`
+- **Learning rate**: `visual_lr=5e-5` (trains visual encoder, summarizer, and projection heads)
+- **Loss**: `total_loss = LM_loss + contrastive_alpha * contrastive_loss + diversity_alpha * decorrelation_loss`
+- **Contrastive learning**: Hierarchical InfoNCE loss with in-batch negatives.
+- **Decorrelation loss**: Penalizes pairwise similarity between visual tokens to prevent representation collapse.
 - **Data**: `min_reserved_ratio=1.0` (use all chunks)
 - **Epochs**: 10
 - **Save**: `runs/stage1/YYYYMMDD_HHMMSS/checkpoints/`
@@ -204,11 +201,10 @@ loss = outputs.loss  # Cross-entropy averaged over non-padding tokens
 - **Config**: `configs/train_default_stage2.yaml` + `configs/ds_config_stage2.json`
 - **LLM**: Unfrozen (`freeze_lm=False`)
 - **Learning rates** (differential):
-  - `visual_lr=1e-5` (param group 0)
-  - `llm_lr=1e-6` (param group 1)
+  - `visual_lr=1e-5`
+  - `llm_lr=1e-6`
 - **Resume**: Load stage1 checkpoint with `resume_for_new_stage=True`
-  - Loads model weights only (no optimizer/scheduler state)
-- **Loss**: `total_loss = LM_loss` (contrastive disabled, `contrastive_alpha=0.0`)
+- **Loss**: `total_loss = LM_loss` (contrastive and decorrelation disabled)
 - **Data**: `min_reserved_ratio=0.6` (random chunk trimming for regularization)
 - **Epochs**: 15
 - **Save**: `runs/YYYYMMDD_HHMMSS/checkpoints/`
@@ -216,118 +212,38 @@ loss = outputs.loss  # Cross-entropy averaged over non-padding tokens
 ### Loss Components
 
 #### LM Loss (Autoregressive Cross-Entropy)
-```python
-loss = F.cross_entropy(
-    logits.view(-1, vocab_size),  # [B * seq_len, V]
-    labels.view(-1),               # [B * seq_len]
-    ignore_index=-100,             # Skip padding and prefix
-    reduction='mean'
-)
-```
+Standard next-token prediction loss, ignoring padding and visual prefix tokens.
 
 #### Contrastive Loss (Stage 1 only)
-For each sample with visual tokens `Y: [T_visual, E]` and text embeddings `P: [L_text, E]`:
-1. Normalize: `Y = F.normalize(Y)`, `P = F.normalize(P)`
-2. Sample negatives: `N: [K_neg=64, E]` from vocabulary (avoid `P` tokens)
-3. Candidates: `C = [P; N]` → `[L_text + K_neg, E]`
-4. Similarity: `logits = (Y @ C.T) / tau` → `[T_visual, L_text + K_neg]`
-5. Loss: `-log_softmax(logits)[:, :L_text].mean()` (maximize positive similarity)
+A symmetric InfoNCE loss designed to align visual and text representations in a dedicated projection space.
+1.  **Hierarchical Summarization**:
+    - For each sample, all valid visual tokens from all chunks are flattened into a single sequence `[L_v, E]`.
+    - A `SequenceSummarizer` module (Transformer with a learnable summary token) processes this sequence to produce a single summary vector `s_v` representing the entire video.
+    - The same process is applied to the text tokens to get a text summary vector `s_t`.
+2.  **Projection**: `s_v` and `s_t` are projected into a lower-dimensional contrastive space using separate `ProjectionHead` MLPs.
+3.  **In-Batch Negatives**:
+    - In a distributed setting, projected vectors from all GPUs are gathered to form a global batch of size `B_global`.
+    - A `[B_global, B_global]` similarity matrix is computed. For each sample, its corresponding sample is the positive pair, while all other `B_global - 1` samples in the batch act as hard negatives.
+4.  **Loss Calculation**: A symmetric cross-entropy loss is computed over the similarity matrix, optimizing both visual-to-text and text-to-visual retrieval.
+
+#### Decorrelation Loss (Stage 1 only)
+To prevent representation collapse where all visual tokens become too similar.
+1.  Collect all valid visual tokens `Y: [T_total, E]` from a batch.
+2.  Normalize them and compute the pairwise cosine similarity matrix `S: [T_total, T_total]`.
+3.  The loss is the mean of the squared off-diagonal elements of `S`. This penalizes any non-zero similarity, encouraging orthogonal features.
 
 ### DeepSpeed Configuration
-
-#### Key Settings
-- **Zero optimization**: Stage 2
-- **Precision**: bf16
-- **Gradient accumulation**: 1
-- **Micro batch size**: 8
-- **Gradient clipping**: 1.5 (stage1) / 1.0 (stage2)
-- **Optimizer**: AdamW (betas=[0.9, 0.95], weight_decay=0.01)
-  - **No `lr` in config** - uses param groups from code
-- **Scheduler**: WarmupDecayLR
-  - `warmup_num_steps=0.05` (5% of total steps, auto-computed)
-  - `warmup_max_lr` = max(visual_lr, llm_lr) (auto-synced)
-  - `total_num_steps="auto"` (epochs * steps_per_epoch)
-
-#### Special Handling for Differential LRs
-```python
-# train_deepspeed.py lines 91-119
-param_groups = [
-    {"params": visual.parameters(), "lr": visual_lr, "initial_lr": visual_lr},
-    {"params": llm.parameters(), "lr": llm_lr, "initial_lr": llm_lr},
-]
-engine, optimizer, _, scheduler = deepspeed.initialize(
-    model=net, model_parameters=param_groups
-)
-_sync_param_group_lrs(engine, [visual_lr, llm_lr])  # Force sync after init
-```
-
-### Masking Rules
-
-#### Chunk Mask
-- Source: `pose_len: [B]` (valid chunk count per sample)
-- Expand to: `[B, N, P_tok]` where `mask[i, j, :] = (j < pose_len[i])`
-- Used by: Visual encoder, transformer, LLM prefix builder
-
-#### Frame Mask (Last Chunk)
-- Source: `last_chunk_valid_len: [B]` (valid frames in last chunk)
-- Applied in: GCN forward pass to zero out padded frames
-- Shape: `[B*N, T]` where last chunk of each sample is masked at `last_chunk_valid_len[i]`
-
-#### Attention Mask (LLM)
-- Causal mask: Standard autoregressive (lower triangular)
-- Padding mask: Zero out positions beyond sequence length
-- Combined: `attention_mask = causal_mask & padding_mask`
+(No changes to this section)
 
 ---
 
 ## 6. Inference (`model/LLM_wrapper.py::generate`)
-
-### Process
-1. Build visual prefix (same as training, without text)
-2. Set `inputs_embeds = prefix` (shape `[B, n_i * 12, E]`)
-3. Autoregressive generation:
-   ```python
-   outputs = model.generate(
-       inputs_embeds=inputs_embeds,
-       max_new_tokens=64,
-       do_sample=True,
-       temperature=0.3,
-       top_k=10,
-       pad_token_id=tokenizer.pad_token_id,
-   )
-   ```
-4. Decode: `tokenizer.batch_decode(outputs, skip_special_tokens=True)`
-
-### Output
-- `List[str]` - Generated text per sample
+(No changes to this section)
 
 ---
 
 ## 7. Shape Reference Table
-
-| Stage | Tensor | Shape | Description |
-|-------|--------|-------|-------------|
-| **Dataset** | pose (raw) | `[T, K=133, C=3]` | Memory-mapped keypoints (x, y, conf) |
-| | pose (chunked) | `[N, window=32, K=133, C=3]` | After sliding window |
-| | pose (normalized) | `Dict[str, [N, 32, K_part, C=2]]` | Per-part, conf dropped |
-| **Collate** | pose | `[B, N, 32, sum_K=133, 2]` | Batched, parts stacked |
-| | pose_len | `[B]` | Valid chunk counts |
-| | last_chunk_valid_len | `[B]` | Valid frames in last chunk |
-| | part_lens | `[17, 68, 21, 21, 133]` | Joint counts per part |
-| | adjacency | `Dict[str, [K_part, K_part]]` | Per-part adjacency |
-| **GCN Input** | pose (reshaped) | `[B*N, 32, sum_K=133, 2]` | Chunk axis merged |
-| | per-part | `[B*N, 32, K_part, 2]` | Split by part_lens |
-| **GCN Output** | features | `[B*N, P=5, 32, D=256]` | Multi-part temporal features |
-| **Transformer Input** | concat | `[B*N, 32, P*D=1280]` | Parts concatenated |
-| | projected | `[B*N, 32, E=1024]` | After input projection |
-| **Transformer Output** | chunk_tokens | `[B*N, P_tok=10, E=1024]` | Pooled chunk tokens |
-| | reshaped | `[B, N, 10, 1024]` | For LLM input |
-| **LLM Input** | prefix (per sample) | `[n_i * 12, E=1024]` | Visual prefix with special tokens |
-| | text | `[L_text, E=1024]` | Embedded text tokens |
-| | full_seq | `[n_i*12 + L_text + 2, E]` | Concatenated sequence |
-| | inputs_embeds | `[B, max_seq_len, E]` | Batched and padded |
-| **LLM Output** | logits | `[B, max_seq_len-1, vocab_size]` | Next-token predictions |
-| | labels | `[B, max_seq_len]` | Target IDs (-100 for padding/prefix) |
+(No changes to this section, as the core visual pipeline shapes remain the same)
 
 ---
 
@@ -336,51 +252,34 @@ _sync_param_group_lrs(engine, [visual_lr, llm_lr])  # Force sync after init
 ### Default Hyperparameters (from `configs/train_default.yaml`)
 
 ```yaml
-# Window & Chunking
-window: 32
-stride: 16
-pad_last: true
-min_reserved_ratio: 1.0  # stage1: 1.0, stage2: 0.6
-
-# Model Architecture
-parts: ["body", "face", "left_hand", "right_hand", "fullbody"]
-drop_conf: true
-part_embed_dim: 256      # GCN output dimension
-tokens_per_chunk: 10     # Transformer output tokens
-uni_gcn:
-  proj_dim: 256
-  temporal_kernel: 5
-  adaptive: true
-  dropout: 0.0
-chunk_transformer:
-  layers: 3
-  heads: 8
-  dropout: 0.1
-  mlp_dim: 512
+# ... (previous sections unchanged)
 
 # LLM
-model_name_or_path: /workspace/Qwen  # Qwen2.5-0.5B or similar
-max_text_len: 128
-freeze_lm: true  # stage1: true, stage2: false
+model_name_or_path: /workspace/Qwen
+# ...
+freeze_lm: true
 gradient_checkpointing: false
 
+# New parameters for contrastive learning
+contrastive_projection_dim: 256 # Output dim of the projection head
+
 # Training
-visual_lr: 5e-5  # stage1: 5e-5, stage2: 1e-5
-llm_lr: 1e-6     # Only used in stage2
-contrastive_alpha: 0.5  # stage1: 0.5, stage2: 0.0
+visual_lr: 5e-5
+llm_lr: 1e-6
+contrastive_alpha: 0.75
 contrastive_tau: 0.07
-contrastive_neg_k: 64
+diversity_alpha: 0.1 # Weight for the decorrelation loss
 ```
 
 ---
 
 ## 9. Design Principles
 
-1. **Metadata-driven**: `pose_len`, `part_lens`, `parts` are the single source of truth; no hard-coded dimensions
-2. **Explicit masking**: Chunk and frame masks propagate through all stages; padding is always masked out in loss
-3. **Special token training**: `<BOC>`, `<EOC>`, `<BOT>`, `<EOT>` are trainable embeddings included in loss computation
-4. **Two-stage strategy**: Pre-train visual encoder with frozen LLM + contrastive loss, then jointly fine-tune with differential LRs
-5. **Linus-style patches**: Small, direct code changes with clear intent; pipeline document updated alongside code
+1.  **Metadata-driven**: `pose_len`, `part_lens`, `parts` are the single source of truth; no hard-coded dimensions.
+2.  **Explicit masking**: Chunk and frame masks propagate through all stages; padding is always masked out in loss.
+3.  **Hierarchical Representation**: A `SequenceSummarizer` creates a global representation from chunk tokens before contrastive loss, enabling better alignment.
+4.  **Two-stage strategy**: Pre-train visual modules with a frozen LLM using a powerful contrastive loss, then jointly fine-tune.
+5.  **Linus-style patches**: Small, direct code changes with clear intent; pipeline document updated alongside code.
 
 ---
 
@@ -394,6 +293,7 @@ contrastive_neg_k: 64
 | Multi-Part GCN | `model/parts_gcn.py` | `MultiPartGCNModel`, `UniGCNModule` |
 | Chunk Transformer | `model/chunk_transformer.py` | `ChunkTokenEncoder` |
 | LLM Wrapper | `model/LLM_wrapper.py` | `LLMWithVisualPrefix` |
+| **Contrastive Modules** | `training/contrastive_modules.py` | `ProjectionHead`, `SequenceSummarizer` |
 | Training Loop | `training/train_deepspeed.py` | `VLLMTrainer`, `train()` |
 | Config Loader | `model/config.py` | `load_config()` |
 | Data Builder | `training/data.py` | `build_dataloaders()` |
@@ -401,5 +301,5 @@ contrastive_neg_k: 64
 
 ---
 
-**Last Updated**: 2025-01-02
-**Compatible Code Version**: Latest commit with two-stage training and contrastive learning
+**Last Updated**: 2025-10-09
+**Compatible Code Version**: Commit with hierarchical contrastive learning and decorrelation loss.

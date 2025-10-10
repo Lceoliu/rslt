@@ -48,6 +48,7 @@ from model.LLM_wrapper import LLMWithVisualPrefix
 from training.data import build_dataloaders
 from training.utils import set_seed, log_logits, compute_cosine_similarity
 from metrics import bleu_report, rouge_report
+from training.contrastive_modules import ProjectionHead, SequenceSummarizer
 
 
 class VLLMTrainer(nn.Module):
@@ -80,9 +81,18 @@ class VLLMTrainer(nn.Module):
         )
         self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
         print(f"LLM hidden size: {self.llm.hidden_size}")
+
+        # --- New Modules for Hierarchical Contrastive Learning ---
+        self.sequence_summarizer = SequenceSummarizer(embed_dim=self.llm.hidden_size)
+        self.projection_dim = int(llm_cfg.get('contrastive_projection_dim', 256))
+        self.visual_proj_head = ProjectionHead(
+            self.llm.hidden_size, self.projection_dim
+        )
+        self.text_proj_head = ProjectionHead(self.llm.hidden_size, self.projection_dim)
+        # ---------------------------------------------------------
+
         self.current_epoch = 0
         self.tau = llm_cfg.get('contrastive_tau', 0.07)
-        self.neg_sample_k = int(llm_cfg.get('contrastive_neg_k', 64))
         self.contrastive_alpha = float(llm_cfg.get('contrastive_alpha', 0.0))
         self.diversity_alpha = float(llm_cfg.get('diversity_alpha', 0.0))
         # For visualization
@@ -96,11 +106,21 @@ class VLLMTrainer(nn.Module):
         visual_lr = float(train_cfg.get("visual_lr", 5e-5))
         llm_lr = float(train_cfg.get("llm_lr", 1e-6))
 
+        # Visual parameters include the encoder, summarizer, and projection heads
+        visual_params = (
+            list(self.visual.parameters())
+            + list(self.sequence_summarizer.parameters())
+            + list(self.visual_proj_head.parameters())
+            + list(self.text_proj_head.parameters())
+        )
+
         if self.freeze_lm:
-            print(f"LLM is frozen. Only training visual encoder with lr={visual_lr}")
+            print(
+                f"LLM is frozen. Only training visual modules with lr={visual_lr}"
+            )
             return [
                 {
-                    "params": self.visual.parameters(),
+                    "params": visual_params,
                     "lr": visual_lr,
                     "initial_lr": visual_lr,
                 }
@@ -109,7 +129,7 @@ class VLLMTrainer(nn.Module):
         print(f"Training with differential LRs: visual_lr={visual_lr}, llm_lr={llm_lr}")
         return [
             {
-                "params": self.visual.parameters(),
+                "params": visual_params,
                 "lr": visual_lr,
                 "initial_lr": visual_lr,
             },
@@ -123,26 +143,40 @@ class VLLMTrainer(nn.Module):
     def get_diverse_loss(
         self, tokens: torch.Tensor, token_mask: torch.Tensor
     ) -> torch.Tensor:
-        """Encourage diversity among the chunk tokens by penalizing low variance."""
+        """
+        Computes a decorrelation loss to penalize similarity between chunk tokens.
+        This encourages the model to produce diverse, non-collapsed representations.
+        """
         # tokens: [B, N, P, E], token_mask: [B, N, P]
-        B, N, P, E = tokens.shape
-
-        # Normalize tokens to prevent scale from affecting variance
-        tokens = F.normalize(tokens, p=2, dim=-1)
 
         # Apply mask to select only valid tokens
         valid_tokens = tokens[token_mask]  # [num_valid_tokens, E]
 
-        if valid_tokens.shape[0] < 2:
-            return torch.tensor(0.0, device=tokens.device)
+        num_valid_tokens = valid_tokens.shape[0]
 
-        # Compute std deviation along the feature dimension
-        std_token = torch.sqrt(valid_tokens.var(dim=0) + 1e-6) # [E]
+        if num_valid_tokens < 2:
+            return torch.tensor(0.0, device=tokens.device, requires_grad=True)
 
-        # The loss is the mean of the std deviations, we want to maximize it.
-        # So we return its negative value.
-        # A small std means collapse, which gives a large loss.
-        loss = -std_token.mean()
+        # Normalize tokens to compute cosine similarity
+        tokens_norm = F.normalize(valid_tokens, p=2, dim=1)
+
+        # Compute the similarity matrix
+        # sim_matrix will be [num_valid_tokens, num_valid_tokens]
+        sim_matrix = torch.matmul(tokens_norm, tokens_norm.t())
+
+        # The loss is the mean of the squared off-diagonal elements.
+        # We want to push the similarity towards 0, making the features orthogonal.
+        # Squaring penalizes large similarities more heavily and ensures the loss
+        # is non-negative. This is inspired by redundancy reduction objectives
+        # in models like Barlow Twins.
+        n = num_valid_tokens
+        # Create a mask for the upper triangle, excluding the diagonal
+        off_diag_mask = torch.triu(torch.ones_like(sim_matrix), diagonal=1).bool()
+
+        # Get the off-diagonal elements
+        off_diag_elements = sim_matrix[off_diag_mask]
+
+        loss = off_diag_elements.pow(2).mean()
 
         return loss
 
@@ -151,81 +185,81 @@ class VLLMTrainer(nn.Module):
         tokens: torch.Tensor,
         token_mask: torch.Tensor,
         texts: Sequence[str],
-        tau: float = 0.07,
     ) -> torch.Tensor:
-        """Encourage similarity between positive pairs and dissimilarity between negative pairs."""
-        # tokens: [B, N, P, E], token_mask: [B, N, P]
+        """
+        Computes InfoNCE loss with in-batch negatives, projection heads,
+        and a sequence summarizer.
+        """
         B, N, P, E = tokens.shape
-        pos_ids = self.llm.get_texts_ids(texts)  # list of [L_i]
-        pos_embeds = [
-            self.llm.get_id_embeddings(ids) for ids in pos_ids
-        ]  # list of [L_i, E]
-        sample_neg_k = self.neg_sample_k
-        neg_embeds = [
-            self.llm.sample_negative_embeddings(sample_neg_k, pos_id).detach()
-            for pos_id in pos_ids
-        ]  # list of [sample_neg_k, E]
-        neg_embeds = torch.stack(neg_embeds, dim=0).to(
-            tokens.device
-        )  # [B, sample_neg_k, E]
-        Lmax = max(pe.shape[0] for pe in pos_embeds)
-        pos_pad = torch.zeros(B, Lmax, E, device=tokens.device)  # [B, Lmax, E]
-        pos_mask = torch.zeros(
-            B, Lmax, dtype=torch.bool, device=tokens.device
-        )  # [B, Lmax]
-        for b, pe in enumerate(pos_embeds):
-            L = pe.shape[0]
-            if L <= 0 or L > Lmax:
-                raise ValueError("Invalid pos_embeds length.")
-            pos_pad[b, :L, :] = pe
-            pos_mask[b, :L] = 1
+        device = tokens.device
 
-        C = torch.cat([pos_pad, neg_embeds], dim=1)  # [B, Lmax + sample_neg_k, E]
-        M = C.shape[1]
-        cand_mask = torch.cat(
-            [
-                pos_mask,
-                torch.ones(B, sample_neg_k, dtype=torch.bool, device=tokens.device),
-            ],
-            dim=1,
-        )  # [B, M]
+        # --- 1. Summarize Visual and Text Sequences ---
+        # a) Prepare batch of visual token sequences (variable length)
+        visual_seqs = [
+            tokens[i][token_mask[i]] for i in range(B)
+        ] # List of [L_v, E]
 
-        C = F.normalize(C, dim=-1)
-        Y = tokens[token_mask].reshape(-1, E).to(C.dtype)  # [sum(B*N*P_valid), E]
-        Y = F.normalize(Y, dim=-1)
+        # b) Prepare batch of text token sequences (variable length)
+        text_ids_list = self.llm.get_texts_ids(texts)
+        text_seqs = [
+            self.llm.get_id_embeddings(ids) for ids in text_ids_list
+        ] # List of [L_t, E]
 
-        with torch.no_grad():
-            b_grid = (
-                torch.arange(B, device=tokens.device).view(B, 1, 1).expand(B, N, P)
-            )  # [B, N, P]
-            b_idx = b_grid[token_mask].contiguous()  # [sum(B*N*P_valid)]
+        def _summarize_batch(sequences: List[torch.Tensor]) -> torch.Tensor:
+            # Helper to pad, summarize, and handle empty sequences
+            non_empty_seqs = []
+            non_empty_indices = []
+            for i, seq in enumerate(sequences):
+                if seq.numel() > 0:
+                    non_empty_seqs.append(seq)
+                    non_empty_indices.append(i)
+            
+            if not non_empty_seqs:
+                return torch.zeros(B, E, device=device)
 
-        loss_list = []
-        start = 0
+            # Pad sequences to the max length in the non-empty batch
+            padded_seqs = nn.utils.rnn.pad_sequence(non_empty_seqs, batch_first=True)
+            # Create a boolean mask (True for valid tokens)
+            mask = (padded_seqs.sum(dim=-1) != 0)
+            
+            summaries = self.sequence_summarizer(padded_seqs, mask=mask)
+            
+            # Place summaries back into a tensor of shape [B, E]
+            full_batch_summaries = torch.zeros(B, E, device=device)
+            full_batch_summaries[non_empty_indices] = summaries
+            return full_batch_summaries
 
-        for b in range(B):
-            Tb = (b_idx == b).sum().item()  # number of valid tokens for sample b
-            if Tb <= 0:
-                continue
-            Yb = Y[start : start + Tb]  # [Tb, E]
-            start += Tb
+        visual_summaries = _summarize_batch(visual_seqs) # [B, E]
+        text_summaries = _summarize_batch(text_seqs) # [B, E]
 
-            Cb = C[b]  # [M, E]
-            logits = (Yb @ Cb.t()) / tau  # [Tb, M]
-            mask_b = cand_mask[b].unsqueeze(0).expand(logits.shape)  # [Tb, M]
-            logits = logits.masked_fill(~mask_b, float('-inf'))  # 用-inf填充padding位置
-            log_probs = F.log_softmax(logits, dim=-1)  # [Tb, M]
+        # --- 2. Project, Gather, and Compute Loss ---
+        projected_visual = self.visual_proj_head(visual_summaries)  # [B, E_proj]
+        projected_text = self.text_proj_head(text_summaries)  # [B, E_proj]
 
-            Lb = pos_mask[b].sum().item()  # length of positive text
-            if Lb <= 0:
-                continue
-            pos_log = log_probs[:, :Lb]  # [Tb, Lb]
-            loss_b = -pos_log.mean()  # average over all tokens and positive texts
-            loss_list.append(loss_b)
+        if dist.is_initialized():
+            world_size = dist.get_world_size()
+            visual_list = [torch.zeros_like(projected_visual) for _ in range(world_size)]
+            text_list = [torch.zeros_like(projected_text) for _ in range(world_size)]
 
-        if len(loss_list) == 0:
-            return torch.tensor(0.0, device=tokens.device, requires_grad=True)
-        loss = torch.stack(loss_list).mean()
+            dist.all_gather(visual_list, projected_visual)
+            dist.all_gather(text_list, projected_text)
+
+            world_visual = torch.cat(visual_list, dim=0)
+            world_text = torch.cat(text_list, dim=0)
+        else:
+            world_visual = projected_visual
+            world_text = projected_text
+
+        world_visual = F.normalize(world_visual, p=2, dim=-1)
+        world_text = F.normalize(world_text, p=2, dim=-1)
+
+        logits_per_visual = (world_visual @ world_text.t()) / self.tau
+
+        labels = torch.arange(logits_per_visual.shape[0], device=device)
+        loss_v2t = F.cross_entropy(logits_per_visual, labels)
+        loss_t2v = F.cross_entropy(logits_per_visual.t(), labels)
+
+        loss = (loss_v2t + loss_t2v) / 2.0
         return loss
 
     def forward(self, batch: Dict[str, Any]):

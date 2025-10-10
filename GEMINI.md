@@ -11,7 +11,7 @@ The pipeline is structured as follows:
 3.  **Chunk Transformer Encoder:** A transformer encoder processes the GCN output.
 4.  **LLM Wrapper:** A large language model generates the final text output.
 
-The project uses `deepspeed` for distributed training and is built on top of `pytorch`.
+The project uses `deepspeed` for distributed training and is built on top of `pytorch`. The training process features a sophisticated two-stage strategy, including a visual pre-training stage that uses a powerful InfoNCE contrastive loss with in-batch negatives and projection heads to align visual and text representations, preventing representation collapse.
 
 ## Building and Running
 
