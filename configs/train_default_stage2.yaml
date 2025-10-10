@@ -6,7 +6,7 @@ train:
   val_interval: 600
   save_dir_root: runs
   save_every: 1200
-  resume_from: "/workspace/rslt/runs/robust/20251006_065837/checkpoints" # modify this
+  resume_from: "runs/robust/REPLACE_WITH_STAGE1_RUN_ID/checkpoints" # IMPORTANT: modify this to the actual checkpoint path from stage 1
   ckpt_tag: "" # specify the checkpoint tag to load, e.g. "global_step1000", or leave it as an empty string to load the latest checkpoint
   resume_for_new_stage: true # if true, will load model weights but not optimizer, lr_scheduler states
   visual_lr: 5e-5  # Keep Stage 1 LR - visual encoder should keep improving
@@ -61,6 +61,7 @@ llm:
   eot_token: "<EOT>"
   contrastive_tau: 0.07
   contrastive_neg_k: 128
+  contrastive_projection_dim: 256 # Dimension of the contrastive projection head
   contrastive_alpha: 0.1  # Keep contrastive learning to constrain visual features
   diversity_alpha: 0.1
 

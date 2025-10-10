@@ -63,6 +63,7 @@ llm:
   eot_token: <EOT>
   contrastive_tau: 0.07
   contrastive_neg_k: 128
+  contrastive_projection_dim: 256 # Dimension of the contrastive projection head
   # --- 关键改动：同时使用对比损失和多样性损失 ---
   contrastive_alpha: 1.0 # 强化对比损失，使其成为主要驱动力
   diversity_alpha: 0.5   # 引入多样性损失，对抗坍塌
