@@ -192,18 +192,19 @@ class VLLMTrainer(nn.Module):
         """
         B, N, P, E = tokens.shape
         device = tokens.device
+        dtype = tokens.dtype  # Get the correct dtype from the input tensor
 
         # --- 1. Summarize Visual and Text Sequences ---
         # a) Prepare batch of visual token sequences (variable length)
         visual_seqs = [
             tokens[i][token_mask[i]] for i in range(B)
-        ] # List of [L_v, E]
+        ]  # List of [L_v, E]
 
         # b) Prepare batch of text token sequences (variable length)
         text_ids_list = self.llm.get_texts_ids(texts)
         text_seqs = [
             self.llm.get_id_embeddings(ids) for ids in text_ids_list
-        ] # List of [L_t, E]
+        ]  # List of [L_t, E]
 
         def _summarize_batch(sequences: List[torch.Tensor]) -> torch.Tensor:
             # Helper to pad, summarize, and handle empty sequences
@@ -213,24 +214,24 @@ class VLLMTrainer(nn.Module):
                 if seq.numel() > 0:
                     non_empty_seqs.append(seq)
                     non_empty_indices.append(i)
-            
+
             if not non_empty_seqs:
-                return torch.zeros(B, E, device=device)
+                return torch.zeros(B, E, device=device, dtype=dtype)
 
             # Pad sequences to the max length in the non-empty batch
             padded_seqs = nn.utils.rnn.pad_sequence(non_empty_seqs, batch_first=True)
             # Create a boolean mask (True for valid tokens)
-            mask = (padded_seqs.sum(dim=-1) != 0)
-            
+            mask = padded_seqs.sum(dim=-1) != 0
+
             summaries = self.sequence_summarizer(padded_seqs, mask=mask)
-            
+
             # Place summaries back into a tensor of shape [B, E]
-            full_batch_summaries = torch.zeros(B, E, device=device)
+            full_batch_summaries = torch.zeros(B, E, device=device, dtype=dtype)
             full_batch_summaries[non_empty_indices] = summaries
             return full_batch_summaries
 
-        visual_summaries = _summarize_batch(visual_seqs) # [B, E]
-        text_summaries = _summarize_batch(text_seqs) # [B, E]
+        visual_summaries = _summarize_batch(visual_seqs)  # [B, E]
+        text_summaries = _summarize_batch(text_seqs)  # [B, E]
 
         # --- 2. Project, Gather, and Compute Loss ---
         projected_visual = self.visual_proj_head(visual_summaries)  # [B, E_proj]
