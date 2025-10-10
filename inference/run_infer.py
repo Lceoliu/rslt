@@ -69,8 +69,8 @@ def predict_for_sample(
         adjacency=adjacency,
     )
     if save_path is not None:
-        S_all, flat_to_cti, Xn = compute_cosine_similarity(tokens, token_mask)
-        plot_similarity(S_all, token_mask, save_path)
+        S_all, flat_to_cti, Xn = compute_cosine_similarity(tokens[0], token_mask[0])
+        plot_similarity(S_all, token_mask[0], save_path)
 
     loss = 0.0
     log_text = None
@@ -263,7 +263,8 @@ def main() -> None:
     for idx, batch in enumerate(tqdm(loader, desc="Inference")):
         gt_text = batch.get("text", [None])[0]
         if args.save_similarity and idx in randomly_selected_indices:
-            save_path = out_dir / f"similarity_{idx:04d}.png"
+            save_path = out_dir / f"similarity/similarity_{idx:04d}.png"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
         else:
             save_path = None
         result = predict_for_sample(
