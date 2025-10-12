@@ -3,9 +3,9 @@ train:
   epochs: 20 # 建议增加训练轮数，确保对比学习收敛
   log_logits: false
   log_interval: 1000
-  val_interval: 400
-  save_dir_root: runs/new
-  save_every: 1000
+  val_interval: 1000
+  save_dir_root: runs
+  save_every: 2000
   resume_from: ''
 
 dataset:
@@ -19,7 +19,7 @@ dataset:
   aug_mask_prob: 0.15
   pad_last: true
   min_reserved_ratio: 1.0
-  window: 30
+  window: 45
   stride: 30
 
 data:
@@ -61,12 +61,12 @@ llm:
   eoc_token: <EOC>
   bot_token: <BOT>
   eot_token: <EOT>
-  contrastive_tau: 0.07
-  contrastive_neg_k: 128
+  contrastive_tau: 0.10
+  contrastive_neg_k: 256
   contrastive_projection_dim: 256 # Dimension of the contrastive projection head
   # --- 关键改动：同时使用对比损失和多样性损失 ---
-  contrastive_alpha: 1.2 # 强化对比损失，使其成为主要驱动力
-  diversity_alpha: 0.5   # 引入多样性损失，对抗坍塌
+  contrastive_alpha: 15.0 # 强化对比损失，使其成为主要驱动力
+  diversity_alpha: 0.25   # 引入多样性损失，对抗坍塌
 
 decoding:
   max_new_tokens: 64

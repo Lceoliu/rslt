@@ -192,6 +192,7 @@ class VLLMTrainer(nn.Module):
         """
         B, N, P, E = tokens.shape
         device = tokens.device
+        dtype = tokens.dtype  # Get the correct dtype from the input tensor
 
         # --- 1. Summarize Visual and Text Sequences ---
         # a) Prepare batch of visual token sequences (variable length)
@@ -213,19 +214,19 @@ class VLLMTrainer(nn.Module):
                 if seq.numel() > 0:
                     non_empty_seqs.append(seq)
                     non_empty_indices.append(i)
-            
+
             if not non_empty_seqs:
-                return torch.zeros(B, E, device=device)
+                return torch.zeros(B, E, device=device, dtype=dtype)
 
             # Pad sequences to the max length in the non-empty batch
             padded_seqs = nn.utils.rnn.pad_sequence(non_empty_seqs, batch_first=True)
             # Create a boolean mask (True for valid tokens)
             mask = (padded_seqs.sum(dim=-1) != 0)
-            
+
             summaries = self.sequence_summarizer(padded_seqs, mask=mask)
-            
+
             # Place summaries back into a tensor of shape [B, E]
-            full_batch_summaries = torch.zeros(B, E, device=device)
+            full_batch_summaries = torch.zeros(B, E, device=device, dtype=dtype)
             full_batch_summaries[non_empty_indices] = summaries
             return full_batch_summaries
 
@@ -290,7 +291,7 @@ class VLLMTrainer(nn.Module):
         )
         # tokens: [B, N, P, E], token_mask: [B, N, P]
         contrastive_loss = (
-            self.get_contrastive_loss(tokens, token_mask, texts, tau=self.tau)
+            self.get_contrastive_loss(tokens, token_mask, texts)
             if self.contrastive_alpha > 0
             else torch.tensor(0.0, device=device)
         )
@@ -759,8 +760,8 @@ def evaluate(engine, loader: DataLoader) -> Tuple[float, Dict[str, float]]:
         for gt, pred in zip(gt_texts, predictions):
             b1 = bleu_report.bleu_score(gt, pred, max_n=1)
             b4 = bleu_report.bleu_score(gt, pred, max_n=4)
-            rl = rouge_report.rouge_l(gt, pred)
-            r1 = rouge_report.rouge_n(gt, pred, n=1)
+            _, _, rl = rouge_report.rouge_l(gt, pred)
+            _, _, r1 = rouge_report.rouge_n(gt, pred, n=1)
             b1s.append(b1)
             b4s.append(b4)
             r1s.append(r1)

@@ -3,14 +3,14 @@ train:
   epochs: 40
   log_logits: false
   log_interval: 1000
-  val_interval: 600
+  val_interval: 1000
   save_dir_root: runs
-  save_every: 1200
-  resume_from: "/workspace/rslt/runs/new/20251008_174533" # modify this
+  save_every: 2000
+  resume_from: "/workspace/rslt/runs/20251010_173006" # modify this
   ckpt_tag: "best" # specify the checkpoint tag to load, e.g. "global_step1000", or leave it as an empty string to load the latest checkpoint
   resume_for_new_stage: true # if true, will load model weights but not optimizer, lr_scheduler states
-  visual_lr: 5e-5  # Keep Stage 1 LR - visual encoder should keep improving
-  llm_lr: 1e-7     # Very small LR (1000x smaller) - LLM only does light adaptation
+  visual_lr: 4e-5  # Keep Stage 1 LR - visual encoder should keep improving
+  llm_lr: 1e-7     
 
 dataset:
   data_dir: /2023234331/data/shm/format_data/csl_shm
@@ -22,7 +22,7 @@ dataset:
   aug_mask_prob: 0.05
   pad_last: true
   min_reserved_ratio: 0.8
-  window: 30
+  window: 45
   stride: 30
 
 data:
@@ -62,7 +62,7 @@ llm:
   contrastive_tau: 0.07
   contrastive_neg_k: 128
   contrastive_projection_dim: 256 # Dimension of the contrastive projection head
-  contrastive_alpha: 0.1  # Keep contrastive learning to constrain visual features
+  contrastive_alpha: 1.5  # Keep contrastive learning to constrain visual features
   diversity_alpha: 0.1
 
 decoding:

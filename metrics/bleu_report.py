@@ -21,7 +21,7 @@ def _ngram_counts(tokens: List[str], n: int) -> Dict[tuple, int]:
     return counts
 
 
-def bleu_score(ref: str, hyp: str, max_n: int = 4, smooth_eps: float = 1e-9) -> float:
+def bleu_score(ref: str, hyp: str, max_n: int = 4, smooth_eps: float = 1e-6) -> float:
     ref_toks = _char_tokenize(ref)
     hyp_toks = _char_tokenize(hyp)
 
@@ -51,7 +51,7 @@ def bleu_score(ref: str, hyp: str, max_n: int = 4, smooth_eps: float = 1e-9) -> 
 
     # 几何平均（等权）
     # 若出现 0，会因上面的 eps 变成很小但不致于报错
-    geo_mean = math.exp(sum(math.log(p) for p in precisions) / max_n)
+    geo_mean = math.exp(sum(math.log(p) for p in precisions if p > 0) / max_n)
 
     # Brevity Penalty
     ref_len = len(ref_toks)
