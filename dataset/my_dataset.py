@@ -27,17 +27,16 @@ class MyDataset(Dataset):
         split: Literal['train', 'val', 'test'] = 'train',
         verbose: bool = False,
     ):
-        self.config = config
+        self.config = config.get('dataset', config)  # Handle nested or flat config
         self.transform = transform
         self.split = split
         self.verbose = verbose
 
-        self._memmap_data = None
-        self._annotations = None
-        self.data_ids = []
-        self._memmap_data_type = np.float32
-        self._load_data()
+        self._memmap_files: List[np.memmap] = []
+        self._annotations: Dict[str, Dict] = {}
+        self.data_ids: List[str] = []
 
+        self._load_data()
         self._split_dataset()
 
         self.min_reserved_ratio = self.config.get('min_reserved_ratio', 0.6)
@@ -51,126 +50,144 @@ class MyDataset(Dataset):
         ), "min_reserved_ratio must be in (0.0, 1.0]"
 
     def _load_data(self):
-        self._data_dir = Path(self.config['data_dir'])
-        assert (
-            self._data_dir.exists()
-        ), f"Data directory {self._data_dir} does not exist."
-        memmap_path = list(self._data_dir.glob('*.dat'))
-        assert (
-            len(memmap_path) == 1
-        ), f"Expected one .dat file in {self._data_dir}, found {len(memmap_path)}."
-        meta_path = self._data_dir / 'meta.json'
-        if not meta_path.exists():
-            meta_path = self._data_dir / 'meta.pkl'
-        assert meta_path.exists(), f"Meta file {meta_path} does not exist."
-        annotation_path = self._data_dir / 'annotation.json'
-        assert (
-            annotation_path.exists()
-        ), f"Annotation file {annotation_path} does not exist."
-        print(f"Start loading dataset from {self._data_dir} ...")
-        if meta_path.suffix == '.pkl':
-            with open(meta_path, 'rb') as f:
-                meta = pickle.load(f)
+        data_dirs_cfg = self.config.get('data_dirs', self.config.get('data_dir'))
+        if isinstance(data_dirs_cfg, str):
+            data_dirs_cfg = [data_dirs_cfg]
+        if not data_dirs_cfg:
+            raise ValueError("'data_dirs' must be specified in the dataset config.")
+
+        self.data_dirs = [Path(d) for d in data_dirs_cfg]
+        shard_name_to_index = {p.name: i for i, p in enumerate(self.data_dirs)}
+
+        # 1. Load all memmap files first
+        for i, data_dir in enumerate(self.data_dirs):
+            if not data_dir.exists():
+                print(f"[Warning] Data directory {data_dir} does not exist. Skipping.")
+                continue
+            memmap_paths = list(data_dir.glob('*.dat')) + list(data_dir.glob('*.bin'))
+            if not memmap_paths:
+                print(f"[Warning] No .dat or .bin file found in {data_dir}. Skipping.")
+                continue
+            meta_path = data_dir / 'meta.json'
+            if not meta_path.exists():
+                meta_path = data_dir / 'meta.pkl'
+            if not meta_path.exists():
+                print(f"[Warning] No meta file found in {data_dir}. Skipping.")
+                continue
+
+            if meta_path.suffix == '.pkl':
+                with open(meta_path, 'rb') as f:
+                    meta = pickle.load(f)
+            else:
+                with open(meta_path, 'r', encoding='utf-8') as f:
+                    meta = json.load(f)
+
+            dtype = np.dtype(meta['dtype'])
+            shape = tuple(meta['shape'])
+            self._memmap_files.append(
+                np.memmap(memmap_paths[0], dtype=dtype, mode='r', shape=shape)
+            )
+            if self.verbose:
+                print(f"Loaded memmap shard {i} from {data_dir} with shape {shape}")
+
+        # 2. Load annotations (auto-detecting format)
+        sharded_annotations = {}
+        for i, data_dir in enumerate(self.data_dirs):
+            annotation_path = data_dir / 'annotation.json'
+            if annotation_path.exists():
+                with open(annotation_path, 'r', encoding='utf-8') as f:
+                    shard_ann = json.load(f)
+                for k, v in shard_ann.items():
+                    v['shard_index'] = i
+                sharded_annotations.update(shard_ann)
+
+        if sharded_annotations:
+            print(
+                f"Detected and loaded sharded annotations from {len(self.data_dirs)} directories."
+            )
+            self._annotations = sharded_annotations
         else:
-            with open(meta_path, 'r', encoding='utf-8') as f:
-                meta = json.load(f)
-        with open(annotation_path, 'r', encoding='utf-8') as f:
-            self._annotations = json.load(f)
-        try:
-            self._memmap_data_type = np.dtype(meta['dtype'])
-        except KeyError as e:
-            raise ValueError(f"Missing key in meta.json: {e}")
-        except Exception as e:
-            if meta['dtype'] == 'float16':
-                self._memmap_data_type = np.float16
-            elif meta['dtype'] == 'float32':
-                self._memmap_data_type = np.float32
-            elif meta['dtype'] == 'float64':
-                self._memmap_data_type = np.float64
-        shape = list(meta['shape'])
-        assert len(shape) == 3, f"Expected shape to be of length 3, got {len(shape)}."
-        self._memmap_data = np.memmap(
-            memmap_path[0],
-            dtype=self._memmap_data_type,
-            mode='r',
-            shape=tuple(shape),
-        )
+            try:
+                common_path = Path(os.path.commonpath([str(p) for p in self.data_dirs]))
+            except ValueError:
+                common_path = self.data_dirs[0].parent
+
+            central_ann_path = common_path / 'annotation.json'
+            print(
+                f"No sharded annotations found. Trying to load centralized annotation from {central_ann_path}"
+            )
+            if not central_ann_path.exists():
+                raise FileNotFoundError(
+                    f"Dataset loading failed: No sharded annotation.json found, and the centralized annotation file was not found at {central_ann_path}"
+                )
+
+            with open(central_ann_path, 'r', encoding='utf-8') as f:
+                central_ann = json.load(f)
+
+            for k, v in central_ann.items():
+                shard_name = v.get('shard')
+                assert (
+                    shard_name is not None
+                ), f"Centralized annotation entry '{k}' is missing the required 'shard' key."
+                shard_index = shard_name_to_index.get(shard_name)
+                assert (
+                    shard_index is not None
+                ), f"Shard name '{shard_name}' for entry '{k}' does not match any directory name in data_dirs: {list(shard_name_to_index.keys())}"
+                v['shard_index'] = shard_index
+            self._annotations = central_ann
+            print(
+                f"Successfully loaded centralized annotations for {len(self._annotations)} samples."
+            )
+
         self.data_ids = list(self._annotations.keys())
-        print(
-            f"Loaded {len(self.data_ids)} samples from {self._data_dir}, memmap shape: {self._memmap_data.shape}, dtype: {self._memmap_data_type}"
-        )
+        random.shuffle(self.data_ids)
+        print(f"Total unique samples loaded across all shards: {len(self.data_ids)}")
 
     def _split_dataset(self):
-        self._data_dir = Path(self.config['data_dir'])
-        split_file = self._data_dir / 'split.json'
-        lock_file = split_file.with_suffix('.lock')
+        # Use the first data directory as the location for the split file
+        split_dir = self.data_dirs[0]
+        split_file = split_dir / 'split.json'
 
-        def _atomic_write_json(path: Path, data: dict):
-            tmp = path.with_suffix(path.suffix + '.tmp')
-            with open(tmp, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False)
-            os.replace(tmp, path)  # 原子替换
-
-        # 已存在则直接读
+        # If split file exists, just use it
         if split_file.exists():
             with open(split_file, 'r', encoding='utf-8') as f:
                 split_data = json.load(f)
             self.data_ids = split_data.get(self.split, [])
-            print(f"Dataset split '{self.split}': {len(self.data_ids)} samples.")
+            print(
+                f"Dataset split '{self.split}': {len(self.data_ids)} samples loaded from {split_file}."
+            )
             return
 
-        # 并发安全的创建：用 O_EXCL 获取简单文件锁，其他进程轮询等待
-        got_lock = False
-        lock_fd = None
-        try:
-            try:
-                lock_fd = os.open(str(lock_file), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                got_lock = True
-            except FileExistsError:
-                got_lock = False
+        # If not, only the main process should create it
+        is_main_process = not dist.is_initialized() or dist.get_rank() == 0
+        if is_main_process:
+            print(f"Split file not found. Creating new split file at {split_file}...")
+            all_ids = self.data_ids  # Already shuffled from _load_data
+            train_cnt = max(1, int(len(all_ids) * 0.8))
+            val_cnt = int(len(all_ids) * 0.1)
+            train_ids = all_ids[:train_cnt]
+            val_ids = all_ids[train_cnt : train_cnt + val_cnt]
+            test_ids = all_ids[train_cnt + val_cnt :]
+            split_data = {"train": train_ids, "val": val_ids, "test": test_ids}
 
-            if got_lock:
-                all_ids = list(self._annotations.keys())
-                # ensure must have one training sample
-                train_cnt = max(1, int(len(all_ids) * 0.8))
-                train_ids = all_ids[:train_cnt]
-                val_ids = all_ids[train_cnt : train_cnt + int(len(all_ids) * 0.1)]
-                test_ids = all_ids[train_cnt + int(len(all_ids) * 0.1) :]
-                split_data = {"train": train_ids, "val": val_ids, "test": test_ids}
-                _atomic_write_json(split_file, split_data)
-            else:
-                # 等待写入完成（最多 ~300s）
-                for _ in range(6000):
-                    if split_file.exists():
-                        break
-                    time.sleep(0.05)
-                if not split_file.exists():
-                    raise TimeoutError(
-                        f"Timed out waiting for {split_file} to be created."
-                    )
-        finally:
-            if lock_fd is not None:
-                try:
-                    os.close(lock_fd)
-                except Exception:
-                    pass
-            if got_lock:
-                try:
-                    os.remove(lock_file)
-                except Exception:
-                    pass
+            # Atomic write
+            tmp_file = split_file.with_suffix('.tmp')
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(split_data, f, ensure_ascii=False)
+            os.replace(tmp_file, split_file)
+            print(
+                f"Created new split file with {len(train_ids)} train, {len(val_ids)} val, {len(test_ids)} test samples."
+            )
 
-        # 若此时已经初始化分布式，可再同步一下（可选）
-        try:
-            if dist.is_available() and dist.is_initialized():
-                dist.barrier()
-        except Exception:
-            pass
+        if dist.is_initialized():
+            dist.barrier()  # Wait for main process to write the file before others read it
 
         with open(split_file, 'r', encoding='utf-8') as f:
             split_data = json.load(f)
         self.data_ids = split_data.get(self.split, [])
-        print(f"Dataset split '{self.split}': {len(self.data_ids)} samples.")
+        print(
+            f"Dataset split '{self.split}': {len(self.data_ids)} samples loaded from {split_file}."
+        )
 
     def speed_augment(self, data: np.ndarray, speed_factor: float) -> np.ndarray:
         '''
@@ -233,8 +250,16 @@ class MyDataset(Dataset):
     def get_pose(self, data_id: str) -> np.ndarray:
         if data_id not in self._annotations:
             raise ValueError(f"Data ID {data_id} not found in annotations.")
-        start, end = self._annotations[data_id]['pose_index']
-        return self._memmap_data[start:end]
+
+        annotation = self._annotations[data_id]
+        shard_index = annotation.get('shard_index')
+        assert (
+            shard_index is not None
+        ), f"Annotation for {data_id} is missing internal 'shard_index'."
+
+        memmap_file = self._memmap_files[shard_index]
+        start, end = annotation['pose_index']
+        return memmap_file[start:end]
 
     def get_adjacency_matrix(self, normalize: bool = False) -> np.ndarray:
         if not self.transform:

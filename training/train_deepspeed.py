@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torch.distributed import ReduceOp
+
 try:
     from torch.utils.tensorboard import SummaryWriter  # type: ignore
 except Exception:
@@ -115,9 +116,7 @@ class VLLMTrainer(nn.Module):
         )
 
         if self.freeze_lm:
-            print(
-                f"LLM is frozen. Only training visual modules with lr={visual_lr}"
-            )
+            print(f"LLM is frozen. Only training visual modules with lr={visual_lr}")
             return [
                 {
                     "params": visual_params,
@@ -196,15 +195,13 @@ class VLLMTrainer(nn.Module):
 
         # --- 1. Summarize Visual and Text Sequences ---
         # a) Prepare batch of visual token sequences (variable length)
-        visual_seqs = [
-            tokens[i][token_mask[i]] for i in range(B)
-        ] # List of [L_v, E]
+        visual_seqs = [tokens[i][token_mask[i]] for i in range(B)]  # List of [L_v, E]
 
         # b) Prepare batch of text token sequences (variable length)
         text_ids_list = self.llm.get_texts_ids(texts)
         text_seqs = [
             self.llm.get_id_embeddings(ids) for ids in text_ids_list
-        ] # List of [L_t, E]
+        ]  # List of [L_t, E]
 
         def _summarize_batch(sequences: List[torch.Tensor]) -> torch.Tensor:
             # Helper to pad, summarize, and handle empty sequences
@@ -221,7 +218,7 @@ class VLLMTrainer(nn.Module):
             # Pad sequences to the max length in the non-empty batch
             padded_seqs = nn.utils.rnn.pad_sequence(non_empty_seqs, batch_first=True)
             # Create a boolean mask (True for valid tokens)
-            mask = (padded_seqs.sum(dim=-1) != 0)
+            mask = padded_seqs.sum(dim=-1) != 0
 
             summaries = self.sequence_summarizer(padded_seqs, mask=mask)
 
@@ -230,8 +227,8 @@ class VLLMTrainer(nn.Module):
             full_batch_summaries[non_empty_indices] = summaries
             return full_batch_summaries
 
-        visual_summaries = _summarize_batch(visual_seqs) # [B, E]
-        text_summaries = _summarize_batch(text_seqs) # [B, E]
+        visual_summaries = _summarize_batch(visual_seqs)  # [B, E]
+        text_summaries = _summarize_batch(text_seqs)  # [B, E]
 
         # --- 2. Project, Gather, and Compute Loss ---
         projected_visual = self.visual_proj_head(visual_summaries)  # [B, E_proj]
@@ -239,7 +236,9 @@ class VLLMTrainer(nn.Module):
 
         if dist.is_initialized():
             world_size = dist.get_world_size()
-            visual_list = [torch.zeros_like(projected_visual) for _ in range(world_size)]
+            visual_list = [
+                torch.zeros_like(projected_visual) for _ in range(world_size)
+            ]
             text_list = [torch.zeros_like(projected_text) for _ in range(world_size)]
 
             dist.all_gather(visual_list, projected_visual)
@@ -279,7 +278,11 @@ class VLLMTrainer(nn.Module):
         device = next(self.visual.parameters()).device
         pose = pose.to(device)
         pose_len = pose_len.to(device) if pose_len is not None else None
-        last_chunk_valid_len = last_chunk_valid_len.to(device) if last_chunk_valid_len is not None else None
+        last_chunk_valid_len = (
+            last_chunk_valid_len.to(device)
+            if last_chunk_valid_len is not None
+            else None
+        )
         adjacency = {k: v.to(device) for k, v in adjacency.items()}
 
         tokens, token_mask, _ = self.visual(
@@ -316,7 +319,11 @@ class VLLMTrainer(nn.Module):
         self.scalers['contrastive_loss'] = contrastive_loss.item()
         self.scalers['diversity_loss'] = diversity_loss.item()
 
-        loss = loss + self.contrastive_alpha * contrastive_loss + self.diversity_alpha * diversity_loss
+        loss = (
+            loss
+            + self.contrastive_alpha * contrastive_loss
+            + self.diversity_alpha * diversity_loss
+        )
         self.scalers['total_loss'] = loss.item()
         return loss
 
@@ -369,6 +376,7 @@ def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
             a[k] = v
     return a
 
+
 def _sync_param_group_lrs(engine, target_lrs):
     optimizer = getattr(engine, "optimizer", None)
     if optimizer is None:
@@ -384,12 +392,14 @@ def _sync_param_group_lrs(engine, target_lrs):
             for group, lr in zip(sched_groups, target_lrs):
                 group["initial_lr"] = lr
 
+
 def get_cast_type(ds_config: Dict[str, Any]) -> torch.dtype:
     if 'bf16' in ds_config and ds_config['bf16'].get('enabled', False):
         return torch.bfloat16
     if 'fp16' in ds_config and ds_config['fp16'].get('enabled', False):
         return torch.float16
     return torch.float32
+
 
 def cast_model(model: nn.Module, dtype: torch.dtype) -> nn.Module:
     if dtype == torch.bfloat16:
@@ -399,6 +409,7 @@ def cast_model(model: nn.Module, dtype: torch.dtype) -> nn.Module:
     else:
         model = model.to(torch.float32)
     return model
+
 
 def get_sync_run_id() -> str:
     run_id = os.environ.get('RUN_ID')
@@ -415,6 +426,7 @@ def get_sync_run_id() -> str:
         run_id = obj[0]  # type: ignore
     return run_id
 
+
 def train(args):
     cfg = load_config(args.config)
     seed = int(cfg.get('train', {}).get('seed', 3407))
@@ -425,10 +437,14 @@ def train(args):
     assert ds_config_path.exists(), f"DeepSpeed config not found: {ds_config_path}"
     with open(ds_config_path, 'r', encoding='utf-8') as f:
         import json
+
         ds_config = json.load(f)
 
     # Align dataloader batch size to DS micro batch size for correctness
-    micro_bs = int(ds_config.get('train_micro_batch_size_per_gpu') or ds_config.get('train_batch_size', 8))
+    micro_bs = int(
+        ds_config.get('train_micro_batch_size_per_gpu')
+        or ds_config.get('train_batch_size', 8)
+    )
     cfg.setdefault('data', {})
     cfg['data']['batch_size'] = micro_bs
 
@@ -546,7 +562,10 @@ def train(args):
         except Exception:
             pass
         log_path = run_dir / 'val_samples.log'
-        logging.basicConfig(level=logging.INFO, handlers=[logging.FileHandler(log_path, encoding='utf-8')])
+        logging.basicConfig(
+            level=logging.INFO,
+            handlers=[logging.FileHandler(log_path, encoding='utf-8')],
+        )
 
     epochs = int(train_cfg.get('epochs', args.epochs))
     log_interval = int(train_cfg.get('log_interval', 1000))
@@ -587,6 +606,7 @@ def train(args):
     def update_learning_rate(step, warmup_steps, total_steps, base_lrs):
         """Cosine annealing with linear warmup for each param group."""
         import math
+
         lrs = []
         for base_lr in base_lrs:
             if step < warmup_steps:
@@ -617,7 +637,9 @@ def train(args):
             iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
         for step, batch in enumerate(iterable):
             # Update learning rates manually
-            current_lrs = update_learning_rate(global_step, warmup_steps, total_num_steps, base_lrs)
+            current_lrs = update_learning_rate(
+                global_step, warmup_steps, total_num_steps, base_lrs
+            )
             if hasattr(engine, 'optimizer') and engine.optimizer is not None:
                 for i, pg in enumerate(engine.optimizer.param_groups):
                     if i < len(current_lrs):
@@ -625,9 +647,15 @@ def train(args):
 
             # move tensors to correct device
             if isinstance(batch, dict):
-                batch = {k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+                batch = {
+                    k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v)
+                    for k, v in batch.items()
+                }
             elif isinstance(batch, (tuple, list)):
-                batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
+                batch = [
+                    b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b
+                    for b in batch
+                ]
             with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
                 loss = engine(batch)  # scalar CE loss from LLM
                 engine.backward(loss)
@@ -720,7 +748,9 @@ def train(args):
 
                     # Sample a few predictions for inspection
                     try:
-                        sample_and_log_predictions(engine, val_loader, cfg, global_step, writer)
+                        sample_and_log_predictions(
+                            engine, val_loader, cfg, global_step, writer
+                        )
                     except Exception as e:
                         print(f"[warn] sample_and_log_predictions failed: {e}")
 
@@ -731,7 +761,9 @@ def train(args):
             writer.flush()
             writer.close()
         print(f"[final eval] val_loss={eval_stat:.6f}")
-    engine.save_checkpoint(str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epochs})
+    engine.save_checkpoint(
+        str(ckpt_dir), client_state={'global_step': global_step, 'epoch': epochs}
+    )
 
 
 @torch.no_grad()
@@ -746,9 +778,15 @@ def evaluate(engine, loader: DataLoader) -> Tuple[float, Dict[str, float]]:
     for batch in loader:
         # move tensors to device
         if isinstance(batch, dict):
-            batch = {k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+            batch = {
+                k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v)
+                for k, v in batch.items()
+            }
         elif isinstance(batch, (tuple, list)):
-            batch = [b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b for b in batch]
+            batch = [
+                b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b
+                for b in batch
+            ]
         loss = engine(batch)
         predictions = engine.module.generate(batch)
         gt_texts = batch.get('text', [''] * len(predictions))
@@ -863,11 +901,14 @@ def sample_and_log_predictions(
     if writer is not None:
         writer.add_text('val/samples', log_text, global_step)
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/train_default.yaml')
     parser.add_argument('--deepspeed', action='store_true')
-    parser.add_argument('--deepspeed_config', type=str, default='configs/ds_config.json')
+    parser.add_argument(
+        '--deepspeed_config', type=str, default='configs/ds_config.json'
+    )
     parser.add_argument('--train_config', type=str, default='')
     parser.add_argument('--epochs', type=int, default=1)
     parser.add_argument('--local_rank', type=int, default=-1, help='for deepspeed')
