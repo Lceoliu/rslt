@@ -12,3 +12,5 @@ logs/
 runs/
 configs/*.json
 !configs/*.yaml
+
+**/temp_*

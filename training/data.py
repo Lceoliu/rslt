@@ -52,7 +52,6 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, int]
     data_cfg = cfg.get('data', {})
     batch_size = int(data_cfg.get('batch_size', 8))
     num_workers = int(data_cfg.get('num_workers', 0))
-    nclass = int(cfg.get('nclass', data_cfg.get('nclass', 10)))
 
     builder_path = data_cfg.get('custom_builder')
     if builder_path:
@@ -61,7 +60,7 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, int]
 
     # Prefer your dataset/my_dataset if provided
     ds_cfg = cfg.get('dataset')
-    if ds_cfg and isinstance(ds_cfg, dict) and ds_cfg.get('data_dir'):
+    if ds_cfg and isinstance(ds_cfg, dict):
         # Late import to avoid heavy deps until needed
         from dataset.my_dataset import create_dataloader
         from dataset.transform import NormalizeProcessor
@@ -87,11 +86,6 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, int]
             pin_memory=True,
             verbose=False,
         )
-        return train_loader, val_loader, nclass
+        return train_loader, val_loader, None
 
-    # Fallback to dummy loaders
-    train_set = DummyPartsDataset(length=int(data_cfg.get('train_length', 128)), T=int(data_cfg.get('T', 32)), nclass=nclass)
-    val_set = DummyPartsDataset(length=int(data_cfg.get('val_length', 64)), T=int(data_cfg.get('T', 32)), nclass=nclass)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=parts_collate)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=parts_collate)
-    return train_loader, val_loader, nclass
+    raise ValueError("No valid dataset configuration found in cfg.")

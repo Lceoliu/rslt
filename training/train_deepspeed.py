@@ -651,11 +651,10 @@ def train(args):
                     k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v)
                     for k, v in batch.items()
                 }
-            elif isinstance(batch, (tuple, list)):
-                batch = [
-                    b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b
-                    for b in batch
-                ]
+            else:
+                raise TypeError(
+                    f'Expected batch dict from dataloader. Get {type(batch)}'
+                )
             with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
                 loss = engine(batch)  # scalar CE loss from LLM
                 engine.backward(loss)

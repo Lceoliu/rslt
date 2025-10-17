@@ -12,6 +12,6 @@ if [ "$(basename "$PWD")" = "scripts" ]; then
 fi
 
 deepspeed --num_gpus=8 --master_port=29501 training/train_deepspeed.py \
-  --config configs/train_robust_stage1.yaml \
+  --config configs/train_cslnews_stage1.yaml \
   --deepspeed \
   --deepspeed_config configs/ds_config_stage1.json

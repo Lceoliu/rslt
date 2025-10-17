@@ -52,11 +52,28 @@ class MyDataset(Dataset):
     def _load_data(self):
         data_dirs_cfg = self.config.get('data_dirs', self.config.get('data_dir'))
         if isinstance(data_dirs_cfg, str):
-            data_dirs_cfg = [data_dirs_cfg]
+            if self.config.get('have_sub_dirs', False):
+                data_dirs_cfg = [p for p in Path(data_dirs_cfg).glob('*') if p.is_dir()]
+            else:
+                data_dirs_cfg = [data_dirs_cfg]
+        elif isinstance(data_dirs_cfg, list):
+            assert all(
+                isinstance(d, str) for d in data_dirs_cfg
+            ), "'data_dirs' must be a list of strings."
+            if self.config.get('have_sub_dirs', False):
+                expanded_dirs = []
+                for d in data_dirs_cfg:
+                    expanded_dirs.extend(list(Path(d).glob('*')))
+                data_dirs_cfg = expanded_dirs
+        else:
+            raise ValueError("'data_dirs' must be a string or a list of strings.")
         if not data_dirs_cfg:
             raise ValueError("'data_dirs' must be specified in the dataset config.")
 
         self.data_dirs = [Path(d) for d in data_dirs_cfg]
+        self.data_dirs = sorted(self.data_dirs)
+        print(f"Loading dataset from {len(self.data_dirs)} directories...")
+        print("\nData directories:\n", self.data_dirs)
         shard_name_to_index = {p.name: i for i, p in enumerate(self.data_dirs)}
 
         # 1. Load all memmap files first
@@ -72,8 +89,15 @@ class MyDataset(Dataset):
             if not meta_path.exists():
                 meta_path = data_dir / 'meta.pkl'
             if not meta_path.exists():
-                print(f"[Warning] No meta file found in {data_dir}. Skipping.")
-                continue
+                meta_paths = list(data_dir.glob('*.json')) + list(
+                    data_dir.glob('*.pkl')
+                )
+                if meta_paths:
+                    meta_path = meta_paths[0]
+            if not meta_path.exists():
+                raise FileNotFoundError(
+                    f"Metadata file not found in {data_dir}. Expected '.json' or '.pkl'."
+                )
 
             if meta_path.suffix == '.pkl':
                 with open(meta_path, 'rb') as f:
@@ -81,7 +105,10 @@ class MyDataset(Dataset):
             else:
                 with open(meta_path, 'r', encoding='utf-8') as f:
                     meta = json.load(f)
-
+            if not {'dtype', 'shape'}.issubset(meta):
+                raise ValueError(
+                    f"Metadata file {meta_path} is missing required keys 'dtype' and 'shape'. Got: {list(meta.keys())}"
+                )
             dtype = np.dtype(meta['dtype'])
             shape = tuple(meta['shape'])
             self._memmap_files.append(
@@ -94,10 +121,17 @@ class MyDataset(Dataset):
         sharded_annotations = {}
         for i, data_dir in enumerate(self.data_dirs):
             annotation_path = data_dir / 'annotation.json'
+            if not annotation_path.exists():
+                possible_paths = list(data_dir.glob('*.json'))
+                if possible_paths:
+                    annotation_path = possible_paths[0]
             if annotation_path.exists():
                 with open(annotation_path, 'r', encoding='utf-8') as f:
                     shard_ann = json.load(f)
                 for k, v in shard_ann.items():
+                    assert isinstance(
+                        v, dict
+                    ), f"Annotation {annotation_path} entry for {k} is not a dict, but {type(v)}"
                     v['shard_index'] = i
                 sharded_annotations.update(shard_ann)
 
@@ -145,7 +179,8 @@ class MyDataset(Dataset):
 
     def _split_dataset(self):
         # Use the first data directory as the location for the split file
-        split_dir = self.data_dirs[0]
+        common_path = Path(os.path.commonpath([str(p) for p in self.data_dirs]))
+        split_dir = common_path
         split_file = split_dir / 'split.json'
 
         # If split file exists, just use it
@@ -163,8 +198,8 @@ class MyDataset(Dataset):
         if is_main_process:
             print(f"Split file not found. Creating new split file at {split_file}...")
             all_ids = self.data_ids  # Already shuffled from _load_data
-            train_cnt = max(1, int(len(all_ids) * 0.8))
-            val_cnt = int(len(all_ids) * 0.1)
+            train_cnt = max(1, int(len(all_ids) * 0.9))
+            val_cnt = int(len(all_ids) * 0.05)
             train_ids = all_ids[:train_cnt]
             val_ids = all_ids[train_cnt : train_cnt + val_cnt]
             test_ids = all_ids[train_cnt + val_cnt :]
@@ -529,9 +564,31 @@ def create_dataloader(
 
 
 if __name__ == "__main__":
-    test_data_path = Path(__file__).parent / 'test_data' / 'shm_overfit'
+    import argparse
+    from pathlib import Path
+
+    args_parser = argparse.ArgumentParser()
+    args_parser.add_argument(
+        '--data_dir',
+        type=str,
+        required=False,
+        default='',
+        help='Path to the dataset directory containing memmap and annotation files.',
+    )
+    args_parser.add_argument(
+        '--have_sub_dirs',
+        action='store_true',
+        help='Whether the data_dir contains multiple sub-directories for shards.',
+    )
+    args = args_parser.parse_args()
+    if args.data_dir:
+        test_data_path = Path(args.data_dir)
+    else:
+        test_data_path = Path(__file__).parent / 'test_data' / 'shm_overfit'
     test_config = {
         'data_dir': str(test_data_path),
+        'have_sub_dirs': args.have_sub_dirs,
+        'seed': 3407,
         'window': 32,
         'stride': 16,
         'min_reserved_ratio': 0.6,
