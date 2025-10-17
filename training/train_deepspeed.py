@@ -68,6 +68,9 @@ class VLLMTrainer(nn.Module):
         gradient_checkpointing = bool(llm_cfg.get('gradient_checkpointing', False))
         self.freeze_lm = bool(llm_cfg.get('freeze_lm', False))
         max_text_len = int(llm_cfg.get('max_text_len', 128))
+        self.compute_special_token_loss = bool(
+            llm_cfg.get('compute_special_token_loss', False)
+        )
         self.llm = LLMWithVisualPrefix(
             model_name_or_path=model_name,
             trust_remote_code=trust_remote_code,
@@ -90,7 +93,6 @@ class VLLMTrainer(nn.Module):
             self.llm.hidden_size, self.projection_dim
         )
         self.text_proj_head = ProjectionHead(self.llm.hidden_size, self.projection_dim)
-        # ---------------------------------------------------------
 
         self.current_epoch = 0
         self.tau = llm_cfg.get('contrastive_tau', 0.07)
@@ -143,8 +145,7 @@ class VLLMTrainer(nn.Module):
         self, tokens: torch.Tensor, token_mask: torch.Tensor
     ) -> torch.Tensor:
         """
-        Computes a decorrelation loss to penalize similarity between chunk tokens.
-        This encourages the model to produce diverse, non-collapsed representations.
+        计算多样性损失，以鼓励视觉特征之间的去相关性。
         """
         # tokens: [B, N, P, E], token_mask: [B, N, P]
 
@@ -163,11 +164,10 @@ class VLLMTrainer(nn.Module):
         # sim_matrix will be [num_valid_tokens, num_valid_tokens]
         sim_matrix = torch.matmul(tokens_norm, tokens_norm.t())
 
-        # The loss is the mean of the squared off-diagonal elements.
-        # We want to push the similarity towards 0, making the features orthogonal.
-        # Squaring penalizes large similarities more heavily and ensures the loss
-        # is non-negative. This is inspired by redundancy reduction objectives
-        # in models like Barlow Twins.
+        # 该损失为上三角（不含对角线）相似度平方值的均值。
+        # 我们希望将相似度推向 0，使特征相互正交（去相关）。
+        # 平方项会更强烈地惩罚较大的相似度，并保证损失为非负值。
+        # 该思路借鉴了像 Barlow Twins 中的冗余减少目标。
         n = num_valid_tokens
         # Create a mask for the upper triangle, excluding the diagonal
         off_diag_mask = torch.triu(torch.ones_like(sim_matrix), diagonal=1).bool()

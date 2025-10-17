@@ -23,6 +23,7 @@ class LLMWithVisualPrefix(nn.Module):
         bot_token: str = "<BOT>",
         eot_token: str = "<EOT>",
         verbose: bool = False,
+        compute_special_token_loss: bool = False,
     ) -> None:
         super().__init__()
         try:
@@ -41,6 +42,7 @@ class LLMWithVisualPrefix(nn.Module):
             print("Using eos token as padding token!")
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.verbose = verbose
+        self.compute_special_token_loss = compute_special_token_loss
         self.special_tokens = {
             "boc": boc_token,
             "eoc": eoc_token,
@@ -253,9 +255,10 @@ class LLMWithVisualPrefix(nn.Module):
         return prefix, token_ids_tensor
 
     def _prefix_labels_from_ids(self, prefix_ids: torch.Tensor) -> torch.Tensor:
-        # labels = prefix_ids.clone()
-        # labels[labels == -1] = -100
-        # return labels
+        if self.compute_special_token_loss:
+            labels = prefix_ids.clone()
+            labels[labels == -1] = -100
+            return labels
         # Ignore all prefix tokens by setting their labels to -100.
         # The model should only be trained to predict the text tokens.
         return torch.full_like(prefix_ids, -100)

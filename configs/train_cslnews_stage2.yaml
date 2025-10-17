@@ -6,22 +6,22 @@ train:
   val_interval: 75000
   save_dir_root: runs
   save_every: 50000
-  resume_from: ''
+  resume_from: '' # modify this
+  ckpt_tag: "best" # specify the checkpoint tag to load, e.g. "global_step1000", or leave it as an empty string to load the latest checkpoint
   visual_lr: 1e-5 # 略微降低学习率，稳定训练
-  llm_lr: 0.0 # LLM冻结，不更新
+  llm_lr: 5e-7 
 
 dataset:
   data_dirs: /2023234331/data/csl_news
   have_sub_dirs: true
   seed: 3407
-  # --- 关键改动：开启并加强数据增强 ---
-  augmentations: 'speed,mask'
-  aug_prob: 0.5
+  augmentations: 'speed'
+  aug_prob: 0.3
   aug_speed_min: 0.8
   aug_speed_max: 1.2
   aug_mask_prob: 0.15
   pad_last: true
-  min_reserved_ratio: 1.0
+  min_reserved_ratio: 0.8
   window: 45
   stride: 30
 
@@ -51,14 +51,14 @@ model:
   chunk_transformer:
     layers: 5
     heads: 8
-    dropout: 0.15 # 增加Transformer的dropout
+    dropout: 0.2 # 增加Transformer的dropout
     mlp_dim: 512
 
 llm:
   model_name_or_path: /workspace/Qwen
   trust_remote_code: true
   max_text_len: 128
-  freeze_lm: true # 核心：此阶段只训练视觉部分
+  freeze_lm: false # 核心：此阶段训练整个模型
   gradient_checkpointing: false
   boc_token: <BOC>
   eoc_token: <EOC>
@@ -68,8 +68,8 @@ llm:
   contrastive_neg_k: 256
   contrastive_projection_dim: 256 # Dimension of the contrastive projection head
   # --- 关键改动：同时使用对比损失和多样性损失 ---
-  contrastive_alpha: 2.5 # TODO: 调整对比损失权重
-  diversity_alpha: 0.5   # TODO: 调整多样性损失权重
+  contrastive_alpha: 1.5 # TODO: 调整对比损失权重
+  diversity_alpha: 0.1   # TODO: 调整多样性损失权重
   compute_special_token_loss: false # TODO: 是否计算特殊token的损失
 
 decoding:
