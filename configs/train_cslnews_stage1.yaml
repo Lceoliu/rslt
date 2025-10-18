@@ -22,8 +22,8 @@ dataset:
   aug_mask_prob: 0.15
   pad_last: true
   min_reserved_ratio: 1.0
-  window: 45
-  stride: 30
+  window: 32
+  stride: 16
 
 data:
   batch_size: 8
@@ -42,7 +42,7 @@ model:
   - fullbody
   drop_conf: true
   part_embed_dim: 256
-  tokens_per_chunk: 12
+  tokens_per_chunk: 10  # TODO: 不要忘了测试改这个的影响
   uni_gcn:
     proj_dim: 256
     temporal_kernel: 7
@@ -68,8 +68,8 @@ llm:
   contrastive_neg_k: 256
   contrastive_projection_dim: 256 # Dimension of the contrastive projection head
   # --- 关键改动：同时使用对比损失和多样性损失 ---
-  contrastive_alpha: 2.5 # TODO: 调整对比损失权重
-  diversity_alpha: 0.5   # TODO: 调整多样性损失权重
+  contrastive_alpha: 0.0 # TODO: 调整对比损失权重
+  diversity_alpha: 0.0   # TODO: 调整多样性损失权重
   compute_special_token_loss: false # TODO: 是否计算特殊token的损失
 
 decoding:

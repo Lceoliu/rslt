@@ -86,18 +86,24 @@ class VLLMTrainer(nn.Module):
         self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
         print(f"LLM hidden size: {self.llm.hidden_size}")
 
+        self.contrastive_alpha = float(llm_cfg.get('contrastive_alpha', 0.0))
+        self.diversity_alpha = float(llm_cfg.get('diversity_alpha', 0.0))
         # --- New Modules for Hierarchical Contrastive Learning ---
-        self.sequence_summarizer = SequenceSummarizer(embed_dim=self.llm.hidden_size)
-        self.projection_dim = int(llm_cfg.get('contrastive_projection_dim', 256))
-        self.visual_proj_head = ProjectionHead(
-            self.llm.hidden_size, self.projection_dim
-        )
-        self.text_proj_head = ProjectionHead(self.llm.hidden_size, self.projection_dim)
+        if self.contrastive_alpha > 0.0:
+            self.sequence_summarizer = SequenceSummarizer(embed_dim=self.llm.hidden_size)
+            self.projection_dim = int(llm_cfg.get('contrastive_projection_dim', 256))
+            self.visual_proj_head = ProjectionHead(
+                self.llm.hidden_size, self.projection_dim
+            )
+            self.text_proj_head = ProjectionHead(self.llm.hidden_size, self.projection_dim)
+        else:
+            self.sequence_summarizer = None
+            self.visual_proj_head = None
+            self.text_proj_head = None
 
         self.current_epoch = 0
         self.tau = llm_cfg.get('contrastive_tau', 0.07)
-        self.contrastive_alpha = float(llm_cfg.get('contrastive_alpha', 0.0))
-        self.diversity_alpha = float(llm_cfg.get('diversity_alpha', 0.0))
+        
         # For visualization
         self.last_logits = None
         self.last_labels = None
@@ -110,12 +116,15 @@ class VLLMTrainer(nn.Module):
         llm_lr = float(train_cfg.get("llm_lr", 1e-6))
 
         # Visual parameters include the encoder, summarizer, and projection heads
-        visual_params = (
-            list(self.visual.parameters())
-            + list(self.sequence_summarizer.parameters())
-            + list(self.visual_proj_head.parameters())
-            + list(self.text_proj_head.parameters())
-        )
+        if self.contrastive_alpha > 0.0:
+            visual_params = (
+                list(self.visual.parameters())
+                + list(self.sequence_summarizer.parameters())
+                + list(self.visual_proj_head.parameters())
+                + list(self.text_proj_head.parameters())
+            )
+        else:
+            visual_params = list(self.visual.parameters())
 
         if self.freeze_lm:
             print(f"LLM is frozen. Only training visual modules with lr={visual_lr}")
