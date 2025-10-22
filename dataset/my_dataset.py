@@ -198,8 +198,8 @@ class MyDataset(Dataset):
         if is_main_process:
             print(f"Split file not found. Creating new split file at {split_file}...")
             all_ids = self.data_ids  # Already shuffled from _load_data
-            train_cnt = max(1, int(len(all_ids) * 0.9))
-            val_cnt = int(len(all_ids) * 0.05)
+            train_cnt = max(1, int(len(all_ids) * 0.98))
+            val_cnt = int(len(all_ids) * 0.01)
             train_ids = all_ids[:train_cnt]
             val_ids = all_ids[train_cnt : train_cnt + val_cnt]
             test_ids = all_ids[train_cnt + val_cnt :]

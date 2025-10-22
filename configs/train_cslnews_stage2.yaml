@@ -2,11 +2,11 @@ train:
   seed: 3407
   epochs: 10 
   log_logits: false
-  log_interval: 75000
-  val_interval: 75000
+  log_interval: 100000
+  val_interval: 100000
   save_dir_root: runs
-  save_every: 50000
-  resume_from: '' # modify this
+  save_every: 100000
+  resume_from: '/workspace/rslt/runs/20251013_113232/checkpoints' # modify this
   ckpt_tag: "best" # specify the checkpoint tag to load, e.g. "global_step1000", or leave it as an empty string to load the latest checkpoint
   visual_lr: 1e-5 # 略微降低学习率，稳定训练
   llm_lr: 5e-7 
@@ -68,7 +68,7 @@ llm:
   contrastive_neg_k: 256
   contrastive_projection_dim: 256 # Dimension of the contrastive projection head
   # --- 关键改动：同时使用对比损失和多样性损失 ---
-  contrastive_alpha: 1.5 # TODO: 调整对比损失权重
+  contrastive_alpha: 0.1 # TODO: 调整对比损失权重
   diversity_alpha: 0.1   # TODO: 调整多样性损失权重
   compute_special_token_loss: false # TODO: 是否计算特殊token的损失
 
