@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -106,6 +106,10 @@ class MultiPartGCNModel(nn.Module):
         self._in_channels: Optional[int] = None
         self.backbones = nn.ModuleDict()
 
+    @property
+    def is_initialized(self) -> bool:
+        return len(self.backbones) > 0
+
     def _ensure_backbones(
         self,
         adjacency: Dict[str, torch.Tensor],
@@ -140,6 +144,38 @@ class MultiPartGCNModel(nn.Module):
             ).to(device)
             self.backbones[part] = backbone
         self._in_channels = in_channels
+
+    def initialize_backbones(
+        self,
+        adjacency: Dict[str, torch.Tensor] | Dict[str, Any],
+        *,
+        in_channels: Optional[int] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        if self.backbones:
+            return
+        if not adjacency:
+            raise ValueError("Adjacency matrices are required to initialise backbones.")
+
+        if in_channels is None:
+            in_channels = 2 if self.drop_conf else 3
+
+        if device is None:
+            param = next(self.parameters(), None)
+            device = param.device if param is not None else torch.device('cpu')
+
+        prepared: Dict[str, torch.Tensor] = {}
+        for part in self.parts:
+            if part not in adjacency:
+                raise KeyError(
+                    f"Missing adjacency for part '{part}' during initialization."
+                )
+            adj = adjacency[part]
+            if not isinstance(adj, torch.Tensor):
+                adj = torch.as_tensor(adj, dtype=torch.float32)
+            prepared[part] = adj.detach().to(device=device, dtype=torch.float32)
+
+        self._ensure_backbones(prepared, in_channels, device)
 
     def forward(
         self,

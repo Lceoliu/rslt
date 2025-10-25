@@ -31,6 +31,7 @@ class MyDataset(Dataset):
         self.transform = transform
         self.split = split
         self.verbose = verbose
+        self.dtype = config.get('dtype', 'bfloat16')
 
         self._memmap_files: List[np.memmap] = []
         self._annotations: Dict[str, Dict] = {}
@@ -299,7 +300,30 @@ class MyDataset(Dataset):
     def get_adjacency_matrix(self, normalize: bool = False) -> np.ndarray:
         if not self.transform:
             raise ValueError("Transform processor is not set.")
-        return self.transform.gen_adjacency_matrix(normalize=normalize, split_part=True)
+        adj_mat = self.transform.gen_adjacency_matrix(
+            normalize=normalize, split_part=True
+        )
+        if isinstance(adj_mat, dict):
+            adj_mat = {
+                k: torch.from_numpy(v) if not isinstance(v, torch.Tensor) else v
+                for k, v in adj_mat.items()
+            }
+            adj_mat = {
+                k: v.to(
+                    dtype=torch.bfloat16 if self.dtype == 'bfloat16' else torch.float32
+                )
+                for k, v in adj_mat.items()
+            }
+        elif isinstance(adj_mat, np.ndarray):
+            adj_mat = torch.from_numpy(adj_mat)
+            adj_mat = adj_mat.to(
+                dtype=torch.bfloat16 if self.dtype == 'bfloat16' else torch.float32
+            )
+        else:
+            raise ValueError(
+                "Adjacency matrix must be a numpy array or a dict of tensors."
+            )
+        return adj_mat
 
     def set_epoch(self, epoch: int) -> None:
         """Allow the caller to update the epoch for RNG derivation."""
@@ -395,16 +419,18 @@ class MyDataset(Dataset):
         pose = {
             k: _slice_chunks(v) for k, v in pose.items()
         }  # {str: Tensor}, (N, window, K, C)
-
+        pose = {
+            k: v.to(dtype=torch.bfloat16 if self.dtype == 'bfloat16' else torch.float32)
+            for k, v in pose.items()
+        }
         sample['pose'] = pose  # {str: Tensor} or Tensor
         sample['text'] = annotation['text']
         sample['gloss'] = annotation.get('gloss', '').split()  # List[str] or []
         sample['id'] = data_id
         sample['frame_cnt'] = reversed_t
-        sample['adjacency_matrix'] = {
-            k: torch.from_numpy(v)
-            for k, v in self.get_adjacency_matrix(normalize=True).items()
-        }  # {str: np.ndarray}
+        sample['adjacency_matrix'] = self.get_adjacency_matrix(
+            normalize=True
+        )  # Tensor or Dict[str, Tensor]
         sample['original_frame_cnt'] = original_t_prime
         sample['stride'] = self.stride
         return sample

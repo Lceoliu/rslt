@@ -83,6 +83,21 @@ class VisualEncoder(nn.Module):
     def parts(self) -> Tuple[str, ...]:
         return self.multipart.parts
 
+    def initialize_backbones(
+        self,
+        adjacency: Dict[str, torch.Tensor],
+        *,
+        in_channels: Optional[int] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        if in_channels is None:
+            in_channels = 2 if self.multipart.drop_conf else 3
+        self.multipart.initialize_backbones(
+            adjacency,
+            in_channels=in_channels,
+            device=device,
+        )
+
     def forward(
         self,
         pose: torch.Tensor,

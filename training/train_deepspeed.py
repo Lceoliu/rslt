@@ -15,7 +15,7 @@ if ENABLE_DEBUG:
 
 
 import argparse
-import os, sys, random, logging
+import os, sys, random, logging, time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Sequence, Optional
@@ -90,12 +90,16 @@ class VLLMTrainer(nn.Module):
         self.diversity_alpha = float(llm_cfg.get('diversity_alpha', 0.0))
         # --- New Modules for Hierarchical Contrastive Learning ---
         if self.contrastive_alpha > 0.0:
-            self.sequence_summarizer = SequenceSummarizer(embed_dim=self.llm.hidden_size)
+            self.sequence_summarizer = SequenceSummarizer(
+                embed_dim=self.llm.hidden_size
+            )
             self.projection_dim = int(llm_cfg.get('contrastive_projection_dim', 256))
             self.visual_proj_head = ProjectionHead(
                 self.llm.hidden_size, self.projection_dim
             )
-            self.text_proj_head = ProjectionHead(self.llm.hidden_size, self.projection_dim)
+            self.text_proj_head = ProjectionHead(
+                self.llm.hidden_size, self.projection_dim
+            )
         else:
             self.sequence_summarizer = None
             self.visual_proj_head = None
@@ -103,7 +107,7 @@ class VLLMTrainer(nn.Module):
 
         self.current_epoch = 0
         self.tau = llm_cfg.get('contrastive_tau', 0.07)
-        
+
         # For visualization
         self.last_logits = None
         self.last_labels = None
@@ -402,6 +406,54 @@ def _sync_param_group_lrs(engine, target_lrs):
                 group["initial_lr"] = lr
 
 
+def _log_batch_devices(
+    tag: str, batch: Any, device: torch.device, max_items: int = 2
+) -> None:
+    """Print tensor device/dtype summaries for debugging."""
+
+    lines: List[str] = []
+
+    def _visit(obj: Any, prefix: str) -> None:
+        if isinstance(obj, torch.Tensor):
+            mismatch = obj.device != device
+            note = " <-- MISMATCH" if mismatch else ""
+            lines.append(
+                f"{prefix}: device={obj.device}, dtype={obj.dtype}, shape={tuple(obj.shape)}{note}"
+            )
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                child = f"{prefix}.{key}" if prefix else str(key)
+                _visit(value, child)
+            return
+        if isinstance(obj, (list, tuple)):
+            length = len(obj)
+            for idx, value in enumerate(obj):
+                if idx >= max_items:
+                    if length > max_items:
+                        lines.append(f"{prefix}[...]: truncated, total={length}")
+                    break
+                child = f"{prefix}[{idx}]"
+                _visit(value, child)
+            return
+
+    _visit(batch, tag)
+    header = f"[device-check] {tag} (expected {device})"
+    print("\n".join([header] + lines))
+
+
+def _move_to_device(obj: Any, device: torch.device) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device=device, non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_move_to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_to_device(v, device) for v in obj)
+    return obj
+
+
 def get_cast_type(ds_config: Dict[str, Any]) -> torch.dtype:
     if 'bf16' in ds_config and ds_config['bf16'].get('enabled', False):
         return torch.bfloat16
@@ -462,8 +514,34 @@ def train(args):
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
     if dist.is_initialized():
         local_rank = dist.get_rank()
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+    if device == torch.device('cpu'):
+        raise RuntimeError("DeepSpeed training requires at least one GPU.")
 
     train_loader, val_loader, _ = build_dataloaders(cfg)
+
+    adjacency_init = None
+    dataset = getattr(train_loader, 'dataset', None)
+    if dataset is not None and hasattr(dataset, 'get_adjacency_matrix'):
+        try:
+            raw_adjacency = dataset.get_adjacency_matrix(normalize=True)
+            if isinstance(raw_adjacency, dict):
+                adjacency_init = {}
+                for part, mat in raw_adjacency.items():
+                    if isinstance(mat, torch.Tensor):
+                        adjacency_init[part] = mat.detach().to(
+                            dtype=torch.float32, device='cpu'
+                        )
+                    else:
+                        adjacency_init[part] = torch.as_tensor(
+                            mat, dtype=torch.float32, device='cpu'
+                        )
+        except Exception as exc:
+            if local_rank in (-1, 0):
+                print(f"[WARN] Failed to preload adjacency matrices: {exc}")
+            adjacency_init = None
 
     # Infer total optimizer steps for scheduler, if provided
     epochs = int(cfg.get('train', {}).get('epochs', args.epochs))
@@ -494,6 +572,13 @@ def train(args):
             params['total_num_steps'] = total_num_steps
 
     net = VLLMTrainer(cfg)
+    if adjacency_init is not None:
+        model_cfg = cfg.get('model', {})
+        default_channels = 2 if bool(model_cfg.get('drop_conf', True)) else 3
+        channels_hint = int(model_cfg.get('input_channels', default_channels))
+        net.visual.initialize_backbones(
+            adjacency_init, in_channels=channels_hint, device=torch.device('cpu')
+        )
     if local_rank == 0:
         print(
             f"Model built. Total params: {sum(p.numel() for p in net.parameters()):,}"
@@ -511,11 +596,23 @@ def train(args):
     )
     _sync_param_group_lrs(engine, target_lrs)
     local_rank = engine.local_rank
+    assert (
+        device == engine.device
+    ), f"DeepSpeed device mismatch: {device} vs (ds) {engine.device}"
     device = engine.device
     print(
         f"DeepSpeed engine initialized. Local rank: {engine.local_rank}, Global rank: {engine.global_rank}"
     )
     net.to(device)
+    if engine.global_rank == 0:
+        try:
+            dtype_check = next(engine.module.parameters()).dtype
+            print(f"Engine module parameter dtype: {dtype_check}")
+        except StopIteration:
+            pass
+        grad_dtype = getattr(engine, "dtype", None)
+        if grad_dtype is not None:
+            print(f"DeepSpeed engine dtype: {grad_dtype}")
 
     train_cfg = cfg.get('train', {})
     resume_from = train_cfg.get('resume_from', '')
@@ -590,14 +687,76 @@ def train(args):
         if ckpt_tag == '':
             ckpt_tag = None  # load latest
         print(f"Loading checkpoint from {ckpt_dir}, tag: {ckpt_tag or 'latest'}")
-        load_path, client_sd = engine.load_checkpoint(
-            str(ckpt_dir),
-            tag=ckpt_tag,
-            load_module_strict=not resume_for_new_stage,
-            load_optimizer_states=not resume_for_new_stage,
-            load_lr_scheduler_states=not resume_for_new_stage,
-            load_module_only=resume_for_new_stage,
-        )
+        load_kwargs = {
+            'tag': ckpt_tag,
+            'load_module_strict': not resume_for_new_stage,
+            'load_optimizer_states': not resume_for_new_stage,
+            'load_lr_scheduler_states': not resume_for_new_stage,
+            'load_module_only': resume_for_new_stage,
+        }
+
+        def _log_checkpoint_mismatch() -> None:
+            if engine.global_rank != 0:
+                return
+            print(
+                f"ERROR: Failed to load checkpoint from {ckpt_dir} with tag {ckpt_tag or 'latest'}"
+            )
+            log_path = run_dir / 'error.log'
+            log_texts = [
+                f"ERROR: Failed to load checkpoint from {ckpt_dir} with tag {ckpt_tag or 'latest'}"
+            ]
+            mismatch_params: List[str] = []
+            ckpt_file = ckpt_dir / f"{ckpt_tag or 'latest'}/mp_rank_00_model_states.pt"
+            if ckpt_file.exists():
+                ckpt = torch.load(str(ckpt_file), map_location='cpu')
+                state_dict = ckpt['module'] if 'module' in ckpt else ckpt
+                model_state_dict = net.state_dict()
+                for k, v in state_dict.items():
+                    if k not in model_state_dict:
+                        mismatch_params.append(f"{k}: not found in model")
+                    elif v.size() != model_state_dict[k].size():
+                        mismatch_params.append(
+                            f"{k}: checkpoint size {v.size()}, model size {model_state_dict[k].size()}"
+                        )
+                log_texts.append("Model expected parameters:")
+                for k, v in model_state_dict.items():
+                    log_texts.append(f"{k}: {v.size()}")
+            log_texts.append(
+                "=========================================================="
+            )
+            if mismatch_params:
+                log_texts.append("Mismatched parameters:")
+                log_texts.extend(mismatch_params)
+            with open(log_path, 'a', encoding='utf-8') as f:
+                for line in log_texts:
+                    f.write(line + '\n')
+
+        try:
+            load_path, client_sd = engine.load_checkpoint(str(ckpt_dir), **load_kwargs)
+        except ValueError as err:
+            msg = str(err).lower()
+            if 'parameter group' in msg and load_kwargs.get(
+                'load_optimizer_states', False
+            ):
+                if engine.global_rank == 0:
+                    print(
+                        "[WARN] Optimizer parameter groups mismatch. Reloading checkpoint without optimizer/scheduler states."
+                    )
+                load_kwargs.update(
+                    load_optimizer_states=False,
+                    load_lr_scheduler_states=False,
+                    load_module_only=True,
+                    load_module_strict=False,
+                )
+                load_path, client_sd = engine.load_checkpoint(
+                    str(ckpt_dir), **load_kwargs
+                )
+            else:
+                _log_checkpoint_mismatch()
+                raise
+        except RuntimeError:
+            _log_checkpoint_mismatch()
+            raise RuntimeError("Checkpoint loading failed")
         if engine.global_rank == 0:
             print(50 * '=')
             print(f"Resumed from checkpoint: {load_path}")
@@ -610,6 +769,8 @@ def train(args):
 
         if not ckpt_dir.exists():
             ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    net.to(device)
 
     # Manual LR scheduling for differential learning rates
     def update_learning_rate(step, warmup_steps, total_steps, base_lrs):
@@ -632,8 +793,10 @@ def train(args):
     base_lrs = target_lrs  # [visual_lr, llm_lr]
 
     min_val_loss = float('inf')
+    logged_train_batch = False
 
     for epoch in range(start_epoch, epochs):
+        prev_step_end = time.time()
         if hasattr(train_loader, 'sampler') and hasattr(
             train_loader.sampler, 'set_epoch'
         ):
@@ -645,6 +808,9 @@ def train(args):
         if engine.global_rank == 0 and tqdm is not None:
             iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
         for step, batch in enumerate(iterable):
+            step_start = time.time()
+            data_time = step_start - prev_step_end
+            profile_step = engine.global_rank == 0 and step < 5
             # Update learning rates manually
             current_lrs = update_learning_rate(
                 global_step, warmup_steps, total_num_steps, base_lrs
@@ -656,19 +822,44 @@ def train(args):
 
             # move tensors to correct device
             if isinstance(batch, dict):
-                batch = {
-                    k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v)
-                    for k, v in batch.items()
-                }
+                batch = _move_to_device(batch, engine.device)
+                if engine.global_rank == 0 and not logged_train_batch:
+                    _log_batch_devices('train_batch', batch, engine.device)
+                    logged_train_batch = True
             else:
                 raise TypeError(
                     f'Expected batch dict from dataloader. Get {type(batch)}'
                 )
+            if profile_step:
+                torch.cuda.synchronize()
+                fwd_start = time.time()
             with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
                 loss = engine(batch)  # scalar CE loss from LLM
-                engine.backward(loss)
+            if profile_step:
+                torch.cuda.synchronize()
+                fwd_time = time.time() - fwd_start
+                bwd_start = time.time()
+            engine.backward(loss)
+            if profile_step:
+                torch.cuda.synchronize()
+                bwd_time = time.time() - bwd_start
+                step_start_time = time.time()
             engine.step()
+            if profile_step:
+                torch.cuda.synchronize()
+                step_time = time.time() - step_start_time
             global_step += 1
+            iter_end = time.time()
+            iter_time = iter_end - step_start
+            prev_step_end = iter_end
+            if engine.global_rank == 0 and step < 5:
+                extras = ""
+                if profile_step:
+                    extras = f" forward={fwd_time:.3f}s backward={bwd_time:.3f}s update={step_time:.3f}s"
+                mem = torch.cuda.max_memory_allocated(device)
+                print(
+                    f"[perf] step={global_step} data_time={data_time:.3f}s iter_time={iter_time:.3f}s{extras} lr={[f'{lr:.2e}' for lr in current_lrs]} mem={mem/1e9:.2f}GB"
+                )
             if hasattr(engine.module, 'current_epoch'):
                 engine.module.current_epoch = global_step
             if writer is not None:
@@ -783,18 +974,17 @@ def evaluate(engine, loader: DataLoader) -> Tuple[float, Dict[str, float]]:
     local_rouge1 = 0.0
     local_bleu4 = 0.0
     local_rougeL = 0.0
+    logged_once = getattr(evaluate, "_logged_device", False)
     for batch in loader:
         # move tensors to device
         if isinstance(batch, dict):
-            batch = {
-                k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v)
-                for k, v in batch.items()
-            }
+            batch = _move_to_device(batch, engine.device)
         elif isinstance(batch, (tuple, list)):
-            batch = [
-                b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b
-                for b in batch
-            ]
+            batch = _move_to_device(batch, engine.device)
+        if not logged_once and (not dist.is_initialized() or dist.get_rank() == 0):
+            _log_batch_devices('eval_batch', batch, engine.device)
+            evaluate._logged_device = True
+            logged_once = True
         loss = engine(batch)
         predictions = engine.module.generate(batch)
         gt_texts = batch.get('text', [''] * len(predictions))
@@ -875,20 +1065,19 @@ def sample_and_log_predictions(
     # randomly pick 5 indices
     sample_indices = random.sample(range(loader_len), min(5, loader_len))
     samples = []
+    logged_once = getattr(sample_and_log_predictions, "_logged_device", False)
     for idx, batch in enumerate(loader):
         if idx not in sample_indices:
             continue
         # move tensors to device
         if isinstance(batch, dict):
-            batch = {
-                k: (v.to(engine.local_rank) if isinstance(v, torch.Tensor) else v)
-                for k, v in batch.items()
-            }
+            batch = _move_to_device(batch, engine.device)
         elif isinstance(batch, (tuple, list)):
-            batch = [
-                b.to(engine.local_rank) if isinstance(b, torch.Tensor) else b
-                for b in batch
-            ]
+            batch = _move_to_device(batch, engine.device)
+        if not logged_once:
+            _log_batch_devices('sample_batch', batch, engine.device)
+            sample_and_log_predictions._logged_device = True
+            logged_once = True
         texts = batch.get('text', [''] * batch['pose'].size(0))
         res = engine.module.generate(batch)
         for i in range(len(texts)):
@@ -915,7 +1104,7 @@ def main():
     parser.add_argument('--config', type=str, default='configs/train_default.yaml')
     parser.add_argument('--deepspeed', action='store_true')
     parser.add_argument(
-        '--deepspeed_config', type=str, default='configs/ds_config.json'
+        '--deepspeed_config', type=str, default='configs/ds_config_stage2.json'
     )
     parser.add_argument('--train_config', type=str, default='')
     parser.add_argument('--epochs', type=int, default=1)
