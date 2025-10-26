@@ -1,9 +1,27 @@
+__all__ = [
+    "log_logits",
+    "accuracy",
+    "set_seed",
+    "compute_cosine_similarity",
+    "plot_similarity",
+    "topk_neighbors",
+    "_deep_update",
+    "_sync_param_group_lrs",
+    "cast_model",
+    "get_cast_type",
+    "_move_to_device",
+    "_log_batch_devices",
+    "get_adj_matrix",
+]
+
 import torch
 import numpy as np
 import random, os
 
 import torch.nn.functional as F
-
+import torch.nn as nn
+from typing import Any
+from dataset.my_dataset import MyDataset
 
 @torch.no_grad()
 def log_logits(module, logits, labels, gt_text, log_path, step=None):
@@ -224,3 +242,99 @@ def topk_neighbors(
 
     nn_sim, nn_idx = torch.topk(S, k=k, dim=-1, largest=True, sorted=True)
     return nn_idx, nn_sim
+
+
+def _deep_update(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(a.get(k), dict):
+            _deep_update(a[k], v)
+        else:
+            a[k] = v
+    return a
+
+
+def _sync_param_group_lrs(engine, target_lrs):
+    optimizer = getattr(engine, "optimizer", None)
+    if optimizer is None:
+        return
+    groups = optimizer.param_groups
+    for group, lr in zip(groups, target_lrs):
+        group["lr"] = lr
+        group["initial_lr"] = lr
+    scheduler = getattr(engine, "lr_scheduler", None)
+    if scheduler is not None:
+        sched_groups = getattr(scheduler, "param_groups", None)
+        if sched_groups:
+            for group, lr in zip(sched_groups, target_lrs):
+                group["initial_lr"] = lr
+
+
+def _log_batch_devices(
+    tag: str, batch: Any, device: torch.device, max_items: int = 2
+) -> None:
+    """Print tensor device/dtype summaries for debugging."""
+
+    lines: List[str] = []
+
+    def _visit(obj: Any, prefix: str) -> None:
+        if isinstance(obj, torch.Tensor):
+            mismatch = obj.device != device
+            note = " <-- MISMATCH" if mismatch else ""
+            lines.append(
+                f"{prefix}: device={obj.device}, dtype={obj.dtype}, shape={tuple(obj.shape)}{note}"
+            )
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                child = f"{prefix}.{key}" if prefix else str(key)
+                _visit(value, child)
+            return
+        if isinstance(obj, (list, tuple)):
+            length = len(obj)
+            for idx, value in enumerate(obj):
+                if idx >= max_items:
+                    if length > max_items:
+                        lines.append(f"{prefix}[...]: truncated, total={length}")
+                    break
+                child = f"{prefix}[{idx}]"
+                _visit(value, child)
+            return
+
+    _visit(batch, tag)
+    header = f"[device-check] {tag} (expected {device})"
+    print("\n".join([header] + lines))
+
+
+def _move_to_device(obj: Any, device: torch.device) -> Any:
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device=device, non_blocking=True)
+    if isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_move_to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_to_device(v, device) for v in obj)
+    return obj
+
+
+def get_cast_type(ds_config: Dict[str, Any]) -> torch.dtype:
+    if 'bf16' in ds_config and ds_config['bf16'].get('enabled', False):
+        return torch.bfloat16
+    if 'fp16' in ds_config and ds_config['fp16'].get('enabled', False):
+        return torch.float16
+    return torch.float32
+
+
+def cast_model(model: nn.Module, dtype: torch.dtype) -> nn.Module:
+    if dtype == torch.bfloat16:
+        model = model.to(torch.bfloat16)
+    elif dtype == torch.float16:
+        model = model.to(torch.float16)
+    else:
+        model = model.to(torch.float32)
+    return model
+
+
+def get_adj_matrix(dataset: MyDataset) -> Dict[str, torch.Tensor] | torch.Tensor:
+    adj_matrix = dataset.get_adjacency_matrix(normalize=True)
+    return adj_matrix

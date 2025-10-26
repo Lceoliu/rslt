@@ -1,6 +1,9 @@
 export PYTHONPATH=$(pwd)
 export TOKENIZERS_PARALLELISM=false
 
+export NCCL_DEBUG=INFO
+
+
 if ! command -v deepspeed >/dev/null 2>&1; then
   echo "[ERROR] deepspeed not found. Install via: pip install deepspeed" >&2
   exit 1

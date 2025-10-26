@@ -297,7 +297,9 @@ class MyDataset(Dataset):
         start, end = annotation['pose_index']
         return memmap_file[start:end]
 
-    def get_adjacency_matrix(self, normalize: bool = False) -> np.ndarray:
+    def get_adjacency_matrix(
+        self, normalize: bool = False
+    ) -> torch.Tensor | Dict[str, torch.Tensor]:
         if not self.transform:
             raise ValueError("Transform processor is not set.")
         adj_mat = self.transform.gen_adjacency_matrix(

@@ -152,10 +152,6 @@ class MultiPartGCNModel(nn.Module):
         in_channels: Optional[int] = None,
         device: Optional[torch.device] = None,
     ) -> None:
-        if self.backbones:
-            return
-        if not adjacency:
-            raise ValueError("Adjacency matrices are required to initialise backbones.")
 
         if in_channels is None:
             in_channels = 2 if self.drop_conf else 3
@@ -172,9 +168,11 @@ class MultiPartGCNModel(nn.Module):
                 )
             adj = adjacency[part]
             if not isinstance(adj, torch.Tensor):
-                adj = torch.as_tensor(adj, dtype=torch.float32)
-            prepared[part] = adj.detach().to(device=device, dtype=torch.float32)
-
+                adj = torch.as_tensor(adj, dtype=torch.bfloat16, device=device)
+            prepared[part] = adj.detach().to(device=device, dtype=torch.bfloat16)
+        print(
+            f"Prepared adjacency matrices for parts: {list(prepared.keys())} \n device: {device}, dtype: {prepared[part].dtype}, in_channels: {in_channels}"
+        )
         self._ensure_backbones(prepared, in_channels, device)
 
     def forward(
