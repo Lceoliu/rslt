@@ -433,10 +433,8 @@ def train(args):
     dataset = getattr(train_loader, 'dataset', None)
     if dataset is not None:
         adjacency_init = get_adj_matrix(dataset)
-        adjacency_init = {
-            k: v.detach().contiguous().to(device=device, dtype=torch.bfloat16)
-            for k, v in adjacency_init.items()
-        }
+        # Keep adjacency on CPU, will be moved to device after DeepSpeed init
+        adjacency_init = {k: v.detach().contiguous() for k, v in adjacency_init.items()}
 
     # Infer total optimizer steps for scheduler, if provided
     epochs = int(cfg.get('train', {}).get('epochs', args.epochs))
@@ -467,16 +465,10 @@ def train(args):
             params['total_num_steps'] = total_num_steps
 
     net = VLLMTrainer(cfg)
-    if adjacency_init is not None:
-        model_cfg = cfg.get('model', {})
-        default_channels = 2 if bool(model_cfg.get('drop_conf', True)) else 3
-        channels_hint = int(model_cfg.get('input_channels', default_channels))
-        net.visual.initialize_backbones(
-            adjacency_init, in_channels=channels_hint, device=device
-        )
+
     if local_rank == 0:
         print(
-            f"Model built. Total params: {sum(p.numel() for p in net.parameters()):,}"
+            f"Model built (backbones not yet initialized). Total params: {sum(p.numel() for p in net.parameters()):,}"
         )
 
     net = cast_model(net, get_cast_type(ds_config))
@@ -496,7 +488,32 @@ def train(args):
     print(
         f"DeepSpeed engine initialized. Local rank: {engine.local_rank}, Global rank: {engine.global_rank}"
     )
-    net.to(device)
+
+    if adjacency_init is not None:
+        model_cfg = cfg.get('model', {})
+        default_channels = 2 if bool(model_cfg.get('drop_conf', True)) else 3
+        channels_hint = int(model_cfg.get('input_channels', default_channels))
+        # Move adjacency to the correct device and dtype
+        adjacency_init_device = {
+            k: v.to(device=engine.device, dtype=torch.bfloat16)
+            for k, v in adjacency_init.items()
+        }
+        engine.module.visual.initialize_backbones(
+            adjacency_init_device, in_channels=channels_hint, device=engine.device
+        )
+
+        if dist.is_initialized():
+            with torch.no_grad():
+                for param in engine.module.visual.parameters():
+                    dist.broadcast(param.data, src=0)
+            if engine.global_rank == 0:
+                print("Visual backbone parameters synchronized across all ranks")
+
+        if engine.global_rank == 0:
+            print(
+                f"Visual backbones initialized. Total params: {sum(p.numel() for p in engine.module.parameters()):,}"
+            )
+
     if engine.global_rank == 0:
         try:
             dtype_check = next(engine.module.parameters()).dtype
@@ -663,7 +680,7 @@ def train(args):
         if not ckpt_dir.exists():
             ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    net.to(device)
+    # No need to call net.to(device) - DeepSpeed manages device placement
 
     # Manual LR scheduling for differential learning rates
     def update_learning_rate(step, warmup_steps, total_steps, base_lrs):
