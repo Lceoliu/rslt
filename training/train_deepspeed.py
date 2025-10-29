@@ -361,7 +361,7 @@ class VLLMTrainer(nn.Module):
         )
         adjacency = {k: v.to(device) for k, v in adjacency.items()}
 
-        tokens, token_mask, _ = self.visual(
+        tokens, token_mask = self.visual(
             pose,
             part_lens=part_lens,
             pose_len=pose_len,

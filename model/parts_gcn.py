@@ -180,33 +180,25 @@ class MultiPartGCNModel(nn.Module):
         pose: torch.Tensor,
         *,
         part_lens: Sequence[int],
-        pose_len: Optional[torch.Tensor] = None,
-        last_chunk_valid_len: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
         adjacency: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> torch.Tensor:
         """Run Uni-GCN encoders over chunked poses.
 
         Args:
-            pose: Tensor shaped [B, N_chunk, chunk_len, sum_K, C].
+            pose: Tensor shaped [B, chunk_len, sum_K, C].
             part_lens: Joint counts per part matching ``self.parts``.
-            pose_len: Optional valid chunk counts per sample ``[B]``.
-            last_chunk_valid_len: Optional valid frame counts for the last chunk ``[B]``.
+            valid_mask: Optional bool mask [B, chunk_len] for valid frames.
             adjacency: Part-wise adjacency matrices used on the first call.
 
         Returns:
-            features: Tensor [B*N_chunk, P, chunk_len, D].
-            frame_mask: Optional bool mask [B*N_chunk, chunk_len] for valid frames.
-            chunk_mask: Optional bool mask [B, N_chunk] for valid chunks.
+            features: Tensor [B, P, chunk_len, D].
         """
 
-        if pose.dim() != 5:
-            raise ValueError(
-                "pose must have shape [B, N_chunk, chunk_len, sum_K, C]."
-            )
         if len(part_lens) != len(self.parts):
             raise ValueError("part_lens length must match the configured parts.")
 
-        batch_size, num_chunks, chunk_len, total_joints, channels = pose.shape
+        batch_size, chunk_len, total_joints, channels = pose.shape
         if sum(part_lens) != total_joints:
             raise ValueError("part_lens must sum to the joint dimension of pose.")
 
@@ -225,33 +217,21 @@ class MultiPartGCNModel(nn.Module):
         elif adjacency is not None:
             self._ensure_backbones(adjacency, channels_used, pose.device)
 
-        frame_mask_float, frame_mask_bool, chunk_mask = _build_masks(
-            pose_len,
-            last_chunk_valid_len,
-            batch=batch_size,
-            num_chunks=num_chunks,
-            chunk_len=chunk_len,
-            device=pose.device,
-            dtype=pose.dtype,
-        )
-
-        flat_pose = pose.reshape(
-            batch_size * num_chunks, chunk_len, total_joints, channels
-        )
+        flat_pose = pose.reshape(batch_size, chunk_len, total_joints, channels)
         part_poses = _slice_pose_by_part(flat_pose, part_lens)
 
         outputs = []
-        mask_for_backbone = frame_mask_float
+
         for part_name, part_pose in zip(self.parts, part_poses):
             if self.drop_conf and channels >= 2:
                 part_pose = part_pose[..., :channels_used]
-            x = part_pose.permute(0, 3, 1, 2).contiguous()  # [B*N, C, T, K]
+            x = part_pose.permute(0, 3, 1, 2).contiguous()  # [B, C, T, K]
             feats = self.backbones[part_name](
                 x,
-                mask=mask_for_backbone,
+                mask=valid_mask,
                 return_seq=True,
-            )  # [B*N, T, D]
+            )  # [B, T, D]
             outputs.append(feats)
 
-        features = torch.stack(outputs, dim=1)  # [B*N, P, T, D]
-        return features, frame_mask_bool, chunk_mask
+        features = torch.stack(outputs, dim=1)  # [B, P, T, D]
+        return features

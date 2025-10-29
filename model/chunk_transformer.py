@@ -42,7 +42,7 @@ class ChunkTokenEncoder(nn.Module):
         in_dim: int,
         model_dim: int,
         num_tokens: int,
-        max_temporal_len: int = 256, # Max frames for PE
+        max_temporal_len: int = 128,  # Max frames for PE
         num_layers: int = 2,
         decoder_layers: int = 2,
         num_heads: int = 8,

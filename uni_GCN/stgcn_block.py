@@ -61,7 +61,7 @@ class GCN_unit(nn.Module):
         else:
             self.register_buffer('A', A)
 
-        self.bn = nn.GroupNorm(32, out_channels)
+        self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
 
     def forward(self, x, len_x=None):
@@ -137,7 +137,7 @@ class STGCN_block(nn.Module):
                     (stride, 1),
                     padding,
                 ),
-                nn.GroupNorm(32, out_channels),
+                nn.BatchNorm2d(out_channels),
                 nn.Dropout(dropout, inplace=True),
             )
         else:
@@ -151,7 +151,7 @@ class STGCN_block(nn.Module):
         else:
             self.residual = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=(stride, 1)),
-                nn.GroupNorm(32, out_channels),
+                nn.BatchNorm2d(out_channels),
             )
 
         self.relu = nn.ReLU(inplace=True)
