@@ -417,6 +417,7 @@ def train(args):
     )
     cfg.setdefault('data', {})
     cfg['data']['batch_size'] = micro_bs
+    use_profiler = bool(cfg.get('train', {}).get('profiler', False))
 
     local_rank = args.local_rank
     if not args.deepspeed:
@@ -550,6 +551,7 @@ def train(args):
 
     # Create directories and define log path on rank 0
     logits_log_path = None
+    profile_log_path = None
     if engine.global_rank == 0:
         if run_dir is None:
             raise ValueError("run_dir is not set for rank 0.")
@@ -562,6 +564,8 @@ def train(args):
         ckpt_dir = ckpt_dir.resolve()
         ckpt_dir.mkdir(parents=True, exist_ok=True)
         logits_log_path = run_dir / 'logits_visualization.log'
+        if use_profiler:
+            profile_log_path = run_dir / 'profiler_trace'
 
     if dist.is_initialized():
         dist.barrier()
@@ -704,13 +708,19 @@ def train(args):
 
     min_val_loss = float('inf')
     logged_train_batch = False
+    step_start = time.time()
+    data_time = 0.0
+    profile_step = False
+
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ],
         schedule=torch.profiler.schedule(wait=0, warmup=1, active=2),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler('./ds_trace'),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            profile_log_path if profile_log_path else './profiler_trace'
+        ),
         record_shapes=True,
         profile_memory=True,
     ) as prof:
@@ -727,9 +737,10 @@ def train(args):
             if engine.global_rank == 0 and tqdm is not None:
                 iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
             for step, batch in enumerate(iterable):
-                step_start = time.time()
-                data_time = step_start - prev_step_end
-                profile_step = engine.global_rank == 0 and step < 5
+                if use_profiler:
+                    step_start = time.time()
+                    data_time = step_start - prev_step_end
+                    profile_step = engine.global_rank == 0 and step < 5
                 # Update learning rates manually
                 current_lrs = update_learning_rate(
                     global_step, warmup_steps, total_num_steps, base_lrs
@@ -749,37 +760,38 @@ def train(args):
                     raise TypeError(
                         f'Expected batch dict from dataloader. Get {type(batch)}'
                     )
-                if profile_step:
+                if use_profiler and profile_step:
                     torch.cuda.synchronize()
                     fwd_start = time.time()
                 with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
                     loss = engine(batch)  # scalar CE loss from LLM
-                if profile_step:
+                if use_profiler and profile_step:
                     torch.cuda.synchronize()
                     fwd_time = time.time() - fwd_start
                     bwd_start = time.time()
 
                 engine.backward(loss)
 
-                if profile_step:
+                if use_profiler and profile_step:
                     torch.cuda.synchronize()
                     bwd_time = time.time() - bwd_start
                     step_start_time = time.time()
                 engine.step()
-                if profile_step:
+                if use_profiler and profile_step:
                     torch.cuda.synchronize()
                     step_time = time.time() - step_start_time
                 global_step += 1
                 iter_end = time.time()
                 iter_time = iter_end - step_start
                 prev_step_end = iter_end
+                if use_profiler:
+                    prof.step()
                 if engine.global_rank == 0 and step < 5:
                     extras = ""
-                    if profile_step:
+                    if use_profiler and profile_step:
                         extras = f" forward={fwd_time:.3f}s backward={bwd_time:.3f}s update={step_time:.3f}s"
-                    mem = torch.cuda.max_memory_allocated(device)
                     print(
-                        f"[perf] step={global_step} data_time={data_time:.3f}s iter_time={iter_time:.3f}s{extras} lr={[f'{lr:.2e}' for lr in current_lrs]} mem={mem/1e9:.2f}GB"
+                        f"[perf] step={global_step} data_time={data_time:.3f}s iter_time={iter_time:.3f}s{extras} lr={[f'{lr:.2e}' for lr in current_lrs]}"
                     )
                 if hasattr(engine.module, 'current_epoch'):
                     engine.module.current_epoch = global_step

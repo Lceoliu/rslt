@@ -1,5 +1,6 @@
 train:
   seed: 3407
+  profiler: true
   epochs: 10 
   log_logits: false
   log_interval: 75000
