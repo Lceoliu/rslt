@@ -135,8 +135,9 @@ class VisualEncoder(nn.Module):
             adjacency=adjacency,
         )
         bn, part_count, _, embed_dim = _reshape_features(features)
+        # seq: [B*N_chunk, chunk_len, Parts * gcn_embed_dim]
         seq = features.permute(0, 2, 1, 3).contiguous().reshape(bn, chunk_len, part_count * embed_dim)
-        # [B*N_chunk, tokens_per_chunk, llm_dim]
+        # tokens: [B*N_chunk, tokens_per_chunk, llm_dim]
         tokens = self.transformer(seq, frame_mask=frame_mask)
         tokens = tokens.view(batch_size, num_chunks, self.tokens_per_chunk, self.llm_dim)
         # [B, N_chunk, tokens_per_chunk]
