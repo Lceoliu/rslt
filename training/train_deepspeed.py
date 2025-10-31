@@ -712,187 +712,186 @@ def train(args):
     data_time = 0.0
     profile_step = False
 
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=2),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(
-            profile_log_path if profile_log_path else './profiler_trace'
-        ),
-        record_shapes=True,
-        profile_memory=True,
-    ) as prof:
-        for epoch in range(start_epoch, epochs):
-            prev_step_end = time.time()
-            if hasattr(train_loader, 'sampler') and hasattr(
-                train_loader.sampler, 'set_epoch'
-            ):
-                train_loader.sampler.set_epoch(epoch)
-            if hasattr(train_loader.dataset, 'set_epoch'):
-                train_loader.dataset.set_epoch(epoch)
-            engine.train()
-            iterable = train_loader
-            if engine.global_rank == 0 and tqdm is not None:
-                iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
-            for step, batch in enumerate(iterable):
-                if use_profiler:
-                    step_start = time.time()
-                    data_time = step_start - prev_step_end
-                    profile_step = engine.global_rank == 0 and step < 5
-                # Update learning rates manually
-                current_lrs = update_learning_rate(
-                    global_step, warmup_steps, total_num_steps, base_lrs
+    if use_profiler and engine.global_rank == 0:
+        print(f"Profiler enabled. Traces will be saved to: {profile_log_path}")
+        prof = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=0, warmup=1, active=2),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(
+                profile_log_path if profile_log_path else './profiler_trace'
+            ),
+            record_shapes=True,
+            profile_memory=True,
+        )
+        prof.__enter__()
+    else:
+        prof = None
+
+    for epoch in range(start_epoch, epochs):
+        prev_step_end = time.time()
+        if hasattr(train_loader, 'sampler') and hasattr(
+            train_loader.sampler, 'set_epoch'
+        ):
+            train_loader.sampler.set_epoch(epoch)
+        if hasattr(train_loader.dataset, 'set_epoch'):
+            train_loader.dataset.set_epoch(epoch)
+        engine.train()
+        iterable = train_loader
+        if engine.global_rank == 0 and tqdm is not None:
+            iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
+        for step, batch in enumerate(iterable):
+            if use_profiler:
+                step_start = time.time()
+                data_time = step_start - prev_step_end
+                profile_step = engine.global_rank == 0 and step < 5
+            # Update learning rates manually
+            current_lrs = update_learning_rate(
+                global_step, warmup_steps, total_num_steps, base_lrs
+            )
+            if hasattr(engine, 'optimizer') and engine.optimizer is not None:
+                for i, pg in enumerate(engine.optimizer.param_groups):
+                    if i < len(current_lrs):
+                        pg['lr'] = current_lrs[i]
+
+            # move tensors to correct device
+            if isinstance(batch, dict):
+                batch = _move_to_device(batch, engine.device)
+                if engine.global_rank == 0 and not logged_train_batch:
+                    _log_batch_devices('train_batch', batch, engine.device)
+                    logged_train_batch = True
+            else:
+                raise TypeError(
+                    f'Expected batch dict from dataloader. Get {type(batch)}'
                 )
-                if hasattr(engine, 'optimizer') and engine.optimizer is not None:
-                    for i, pg in enumerate(engine.optimizer.param_groups):
-                        if i < len(current_lrs):
-                            pg['lr'] = current_lrs[i]
+            if use_profiler and profile_step:
+                torch.cuda.synchronize()
+                fwd_start = time.time()
+            with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
+                loss = engine(batch)  # scalar CE loss from LLM
+            if use_profiler and profile_step:
+                torch.cuda.synchronize()
+                fwd_time = time.time() - fwd_start
+                bwd_start = time.time()
 
-                # move tensors to correct device
-                if isinstance(batch, dict):
-                    batch = _move_to_device(batch, engine.device)
-                    if engine.global_rank == 0 and not logged_train_batch:
-                        _log_batch_devices('train_batch', batch, engine.device)
-                        logged_train_batch = True
+            engine.backward(loss)
+
+            if use_profiler and profile_step:
+                torch.cuda.synchronize()
+                bwd_time = time.time() - bwd_start
+                step_start_time = time.time()
+            engine.step()
+            if use_profiler and profile_step:
+                torch.cuda.synchronize()
+                step_time = time.time() - step_start_time
+            global_step += 1
+            iter_end = time.time()
+            iter_time = iter_end - step_start
+            prev_step_end = iter_end
+            if use_profiler and profile_step and engine.global_rank == 0:
+                prof.step()
+            if engine.global_rank == 0 and step < 5:
+                extras = ""
+                if use_profiler and profile_step:
+                    extras = f" forward={fwd_time:.3f}s backward={bwd_time:.3f}s update={step_time:.3f}s"
+                print(
+                    f"[perf] step={global_step} data_time={data_time:.3f}s iter_time={iter_time:.3f}s{extras} lr={[f'{lr:.2e}' for lr in current_lrs]}"
+                )
+            if hasattr(engine.module, 'current_epoch'):
+                engine.module.current_epoch = global_step
+            if writer is not None:
+                for k, v in engine.module.scalers.items():
+                    writer.add_scalar(f'train/{k}', float(v), global_step)
+                # Try to log LR
+                try:
+                    if hasattr(engine, 'optimizer') and engine.optimizer is not None:
+                        pgs = getattr(engine.optimizer, 'param_groups', None)
+                        if pgs:
+                            # Log learning rates for both groups
+                            for i, pg in enumerate(pgs):
+                                writer.add_scalar(
+                                    f'train/lr_group_{i}',
+                                    float(pg.get('lr', 0.0)),
+                                    global_step,
+                                )
+                except Exception:
+                    pass
+            if (
+                engine.global_rank == 0
+                and (global_step % log_interval == 0)
+                and log_logits
+            ):
+                loss_val = loss.item()
+                if tqdm is None:
+                    print(f"epoch={epoch} step={global_step} loss={loss_val:.6f}")
                 else:
-                    raise TypeError(
-                        f'Expected batch dict from dataloader. Get {type(batch)}'
-                    )
-                if use_profiler and profile_step:
-                    torch.cuda.synchronize()
-                    fwd_start = time.time()
-                with torch.autocast(device_type='cuda', dtype=get_cast_type(ds_config)):
-                    loss = engine(batch)  # scalar CE loss from LLM
-                if use_profiler and profile_step:
-                    torch.cuda.synchronize()
-                    fwd_time = time.time() - fwd_start
-                    bwd_start = time.time()
+                    iterable.set_postfix({"loss": f"{loss_val:.6f}"})
 
-                engine.backward(loss)
+                # Log abnormal loss values
+                if loss_val > 20 or loss_val < 0:
+                    print(f"WARNING: Abnormal loss value: {loss_val}")
 
-                if use_profiler and profile_step:
-                    torch.cuda.synchronize()
-                    bwd_time = time.time() - bwd_start
-                    step_start_time = time.time()
-                engine.step()
-                if use_profiler and profile_step:
-                    torch.cuda.synchronize()
-                    step_time = time.time() - step_start_time
-                global_step += 1
-                iter_end = time.time()
-                iter_time = iter_end - step_start
-                prev_step_end = iter_end
-                if use_profiler:
-                    prof.step()
-                if engine.global_rank == 0 and step < 5:
-                    extras = ""
-                    if use_profiler and profile_step:
-                        extras = f" forward={fwd_time:.3f}s backward={bwd_time:.3f}s update={step_time:.3f}s"
-                    print(
-                        f"[perf] step={global_step} data_time={data_time:.3f}s iter_time={iter_time:.3f}s{extras} lr={[f'{lr:.2e}' for lr in current_lrs]}"
-                    )
-                if hasattr(engine.module, 'current_epoch'):
-                    engine.module.current_epoch = global_step
-                if writer is not None:
-                    for k, v in engine.module.scalers.items():
-                        writer.add_scalar(f'train/{k}', float(v), global_step)
-                    # Try to log LR
-                    try:
-                        if (
-                            hasattr(engine, 'optimizer')
-                            and engine.optimizer is not None
-                        ):
-                            pgs = getattr(engine.optimizer, 'param_groups', None)
-                            if pgs:
-                                # Log learning rates for both groups
-                                for i, pg in enumerate(pgs):
-                                    writer.add_scalar(
-                                        f'train/lr_group_{i}',
-                                        float(pg.get('lr', 0.0)),
-                                        global_step,
-                                    )
-                    except Exception:
-                        pass
-                if (
-                    engine.global_rank == 0
-                    and (global_step % log_interval == 0)
-                    and log_logits
-                ):
-                    loss_val = loss.item()
-                    if tqdm is None:
-                        print(f"epoch={epoch} step={global_step} loss={loss_val:.6f}")
-                    else:
-                        iterable.set_postfix({"loss": f"{loss_val:.6f}"})
+                # Logits visualization
+                try:
+                    if (
+                        engine.module.last_logits is not None
+                        and engine.module.last_labels is not None
+                    ):
+                        log_logits(
+                            engine.module,
+                            engine.module.last_logits,
+                            engine.module.last_labels,
+                            (
+                                batch['text'][0]
+                                if isinstance(batch, dict) and 'text' in batch
+                                else ""
+                            ),
+                            logits_log_path,
+                            step=global_step,
+                        )
 
-                    # Log abnormal loss values
-                    if loss_val > 20 or loss_val < 0:
-                        print(f"WARNING: Abnormal loss value: {loss_val}")
+                except Exception as e:
+                    print(f"[WARN] Failed to visualize logits: {e}")
 
-                    # Logits visualization
-                    try:
-                        if (
-                            engine.module.last_logits is not None
-                            and engine.module.last_labels is not None
-                        ):
-                            log_logits(
-                                engine.module,
-                                engine.module.last_logits,
-                                engine.module.last_labels,
-                                (
-                                    batch['text'][0]
-                                    if isinstance(batch, dict) and 'text' in batch
-                                    else ""
-                                ),
-                                logits_log_path,
-                                step=global_step,
-                            )
-
-                    except Exception as e:
-                        print(f"[WARN] Failed to visualize logits: {e}")
-
-                # Periodic checkpointing on all ranks
-                if (
-                    save_every > 0
-                    and (global_step % save_every == 0)
-                    and global_step > 0
-                ):
+            # Periodic checkpointing on all ranks
+            if save_every > 0 and (global_step % save_every == 0) and global_step > 0:
+                engine.save_checkpoint(
+                    str(ckpt_dir),
+                    client_state={'global_step': global_step, 'epoch': epoch},
+                )
+            if global_step % val_interval == 0 and global_step > 0:
+                eval_stat, score_dict = evaluate(engine, val_loader)
+                val_loss = float(eval_stat)
+                if val_loss < min_val_loss:
+                    min_val_loss = val_loss
+                    # Save best checkpoint
                     engine.save_checkpoint(
                         str(ckpt_dir),
+                        tag='best',
                         client_state={'global_step': global_step, 'epoch': epoch},
                     )
-                if global_step % val_interval == 0 and global_step > 0:
-                    eval_stat, score_dict = evaluate(engine, val_loader)
-                    val_loss = float(eval_stat)
-                    if val_loss < min_val_loss:
-                        min_val_loss = val_loss
-                        # Save best checkpoint
-                        engine.save_checkpoint(
-                            str(ckpt_dir),
-                            tag='best',
-                            client_state={'global_step': global_step, 'epoch': epoch},
-                        )
-                        print(
-                            f"  [info] New best model saved at step {global_step} with val_loss={val_loss:.6f}"
-                        )
-                    if engine.global_rank == 0:
-                        if writer is not None:
-                            writer.add_scalar('val/loss', float(eval_stat), global_step)
-                            for metric, score in score_dict.items():
-                                writer.add_scalar(
-                                    f'val/{metric}', float(score), global_step
-                                )
-                        print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
-
-                        # Sample a few predictions for inspection
-                        try:
-                            sample_and_log_predictions(
-                                engine, val_loader, cfg, global_step, writer
+                    print(
+                        f"  [info] New best model saved at step {global_step} with val_loss={val_loss:.6f}"
+                    )
+                if engine.global_rank == 0:
+                    if writer is not None:
+                        writer.add_scalar('val/loss', float(eval_stat), global_step)
+                        for metric, score in score_dict.items():
+                            writer.add_scalar(
+                                f'val/{metric}', float(score), global_step
                             )
-                        except Exception as e:
-                            print(f"[warn] sample_and_log_predictions failed: {e}")
+                    print(f"[eval] step={global_step} val_loss={eval_stat:.6f}")
 
+                    # Sample a few predictions for inspection
+                    try:
+                        sample_and_log_predictions(
+                            engine, val_loader, cfg, global_step, writer
+                        )
+                    except Exception as e:
+                        print(f"[warn] sample_and_log_predictions failed: {e}")
+    if prof is not None:
+        prof.__exit__(None, None, None)
     eval_stat, score_dict = evaluate(engine, val_loader)
     if engine.global_rank == 0:
         if writer is not None:

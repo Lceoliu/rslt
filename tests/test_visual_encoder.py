@@ -23,10 +23,9 @@ def test_visual_encoder_shapes_and_masks() -> None:
     encoder = VisualEncoder(
         gcn_embed_dim=16,
         gcn_proj_dim=8,
-        tokens_per_chunk=3,
+        tokens_per_chunk=0,
         llm_dim=24,
-        transformer_layers=1,
-        transformer_heads=4,
+        sampling_stride=2,
     )
     pose = _make_pose(batch=2, chunks=3, length=4, part_lens=part_lens)
     pose_len = torch.tensor([3, 2], dtype=torch.long)
@@ -39,11 +38,12 @@ def test_visual_encoder_shapes_and_masks() -> None:
         adjacency=adjacency,
     )
 
-    assert tokens.shape == (2, 3, 3, 24)
-    assert token_mask.shape == (2, 3, 3)
+    assert tokens.shape == (2, 3, 2, 24)
+    assert token_mask.shape == (2, 3, 2)
     assert chunk_mask.shape == (2, 3)
     # Last chunk of second sample should be padding
-    assert token_mask[1, 2].tolist() == [False, False, False]
+    assert token_mask[1, 2].tolist() == [False, False]
+    assert torch.all(tokens[1, 2] == 0)
 
 
 def test_visual_encoder_no_pose_len() -> None:
@@ -51,12 +51,11 @@ def test_visual_encoder_no_pose_len() -> None:
     encoder = VisualEncoder(
         gcn_embed_dim=8,
         gcn_proj_dim=4,
-        tokens_per_chunk=2,
+        tokens_per_chunk=0,
         llm_dim=12,
-        transformer_layers=1,
-        transformer_heads=4,
+        sampling_stride=2,
     )
-    pose = _make_pose(batch=1, chunks=2, length=5, part_lens=part_lens)
+    pose = _make_pose(batch=1, chunks=2, length=4, part_lens=part_lens)
     adjacency = _make_adjacency(part_lens)
 
     tokens, token_mask, chunk_mask = encoder(
