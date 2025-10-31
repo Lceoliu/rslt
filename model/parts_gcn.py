@@ -251,6 +251,8 @@ class MultiPartGCNModel(nn.Module):
                 mask=mask_for_backbone,
                 return_seq=True,
             )  # [B*N, T, D]
+            if feats.dtype != part_pose.dtype:
+                feats = feats.to(part_pose.dtype)
             outputs.append(feats)
 
         features = torch.stack(outputs, dim=1)  # [B*N, P, T, D]
