@@ -1,31 +1,15 @@
 from __future__ import annotations
 
 from typing import Dict, Optional, Sequence, Tuple
+import warnings
 
 import torch
 import torch.nn as nn
 import pdb
 
-from .chunk_transformer import ChunkTokenEncoder
 from .parts_gcn import MultiPartGCNModel
 
 __all__ = ["VisualEncoder"]
-
-
-def _expand_chunk_mask(
-    chunk_mask: Optional[torch.Tensor],
-    *,
-    batch: int,
-    num_chunks: int,
-    tokens_per_chunk: int,
-    device: torch.device,
-) -> torch.Tensor:
-    if chunk_mask is None:
-        return torch.ones(batch, num_chunks, tokens_per_chunk, dtype=torch.bool, device=device)
-    if chunk_mask.shape != (batch, num_chunks):
-        raise ValueError("chunk_mask shape mismatch.")
-    expanded = chunk_mask.view(batch, num_chunks, 1)
-    return expanded.expand(-1, -1, tokens_per_chunk)
 
 
 def _reshape_features(
@@ -37,7 +21,7 @@ def _reshape_features(
 
 
 class VisualEncoder(nn.Module):
-    """Multi-part GCN + transformer encoder that outputs chunk tokens."""
+    """Multi-part GCN encoder that downsamples temporal frames into LLM tokens."""
 
     def __init__(
         self,
@@ -51,10 +35,7 @@ class VisualEncoder(nn.Module):
         gcn_dropout: float = 0.0,
         tokens_per_chunk: int = 4,
         llm_dim: int = 1024,
-        transformer_layers: int = 2,
-        transformer_heads: int = 4,
-        transformer_mlp: Optional[int] = None,
-        transformer_dropout: float = 0.1,
+        sampling_stride: int = 2,
     ) -> None:
         super().__init__()
         self.multipart = MultiPartGCNModel(
@@ -67,17 +48,13 @@ class VisualEncoder(nn.Module):
             dropout=gcn_dropout,
         )
         part_count = len(self.multipart.parts)
-        self.tokens_per_chunk = tokens_per_chunk
+        if sampling_stride <= 0:
+            raise ValueError("sampling_stride must be a positive integer.")
+        self.sampling_stride = int(sampling_stride)
+        self.tokens_per_chunk = int(tokens_per_chunk) if tokens_per_chunk > 0 else None
+        self._tokens_warned = False
         self.llm_dim = llm_dim
-        self.transformer = ChunkTokenEncoder(
-            in_dim=part_count * gcn_embed_dim,
-            model_dim=llm_dim,
-            num_tokens=tokens_per_chunk,
-            num_layers=transformer_layers,
-            num_heads=transformer_heads,
-            mlp_dim=transformer_mlp,
-            dropout=transformer_dropout,
-        )
+        self.projection = nn.Linear(part_count * gcn_embed_dim, llm_dim)
 
     @property
     def parts(self) -> Tuple[str, ...]:
@@ -136,18 +113,57 @@ class VisualEncoder(nn.Module):
         )
         bn, part_count, _, embed_dim = _reshape_features(features)
         # seq: [B*N_chunk, chunk_len, Parts * gcn_embed_dim]
-        seq = features.permute(0, 2, 1, 3).contiguous().reshape(bn, chunk_len, part_count * embed_dim)
-        # tokens: [B*N_chunk, tokens_per_chunk, llm_dim]
-        tokens = self.transformer(seq, frame_mask=frame_mask)
-        tokens = tokens.view(batch_size, num_chunks, self.tokens_per_chunk, self.llm_dim)
-        # [B, N_chunk, tokens_per_chunk]
-        token_mask = _expand_chunk_mask(
-            chunk_mask,
-            batch=batch_size,
-            num_chunks=num_chunks,
-            tokens_per_chunk=self.tokens_per_chunk,
-            device=pose.device,
+        seq = (
+            features.permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(bn, chunk_len, part_count * embed_dim)
         )
-        if chunk_mask is None:
-            chunk_mask = torch.ones(batch_size, num_chunks, dtype=torch.bool, device=pose.device)
+        if chunk_len % self.sampling_stride != 0:
+            raise ValueError(
+                f"chunk_len ({chunk_len}) must be divisible by sampling_stride ({self.sampling_stride})."
+            )
+        seq = seq[:, :: self.sampling_stride, :]
+        if frame_mask is not None:
+            frame_mask = frame_mask[:, :: self.sampling_stride]
+            seq = seq * frame_mask.unsqueeze(-1).to(seq.dtype)
+        tokens = self.projection(seq)
+        tokens_per_chunk = tokens.size(1)
+        if self.tokens_per_chunk is None:
+            self.tokens_per_chunk = tokens_per_chunk
+        elif self.tokens_per_chunk != tokens_per_chunk:
+            if not self._tokens_warned:
+                warnings.warn(
+                    (
+                        "Configured tokens_per_chunk differs from the computed value "
+                        f"({self.tokens_per_chunk} vs {tokens_per_chunk}); "
+                        "using the computed value for downstream modules."
+                    ),
+                    RuntimeWarning,
+                )
+                self._tokens_warned = True
+            self.tokens_per_chunk = tokens_per_chunk
+        tokens = tokens.view(
+            batch_size, num_chunks, self.tokens_per_chunk, self.llm_dim
+        )
+        if frame_mask is not None:
+            token_mask = frame_mask.view(
+                batch_size, num_chunks, self.tokens_per_chunk
+            )
+        else:
+            token_mask = torch.ones(
+                batch_size,
+                num_chunks,
+                self.tokens_per_chunk,
+                dtype=torch.bool,
+                device=pose.device,
+            )
+        chunk_mask = (
+            chunk_mask
+            if chunk_mask is not None
+            else torch.ones(
+                batch_size, num_chunks, dtype=torch.bool, device=pose.device
+            )
+        )
+        token_mask = token_mask.to(torch.bool) & chunk_mask.unsqueeze(-1)
+        tokens = tokens * token_mask.unsqueeze(-1).to(tokens.dtype)
         return tokens, token_mask, chunk_mask

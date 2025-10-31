@@ -28,10 +28,8 @@ def build_visual_encoder(cfg: Dict[str, Any], llm_dim: int) -> VisualEncoder:
     mcfg = cfg.get("model", {})
     parts = _ensure_parts(mcfg.get("parts", PARTS_DEFAULT))
     uni_cfg = mcfg.get("uni_gcn", {})
-    transformer_cfg = mcfg.get("chunk_transformer", {})
-
-    mlp_raw = transformer_cfg.get("mlp_dim")
-    mlp_dim = int(mlp_raw) if mlp_raw is not None else None
+    sampling_stride = int(mcfg.get("temporal_sampling_stride", 2))
+    tokens_per_chunk = int(mcfg.get("tokens_per_chunk", 0))
 
     encoder = VisualEncoder(
         parts=parts,
@@ -41,12 +39,9 @@ def build_visual_encoder(cfg: Dict[str, Any], llm_dim: int) -> VisualEncoder:
         gcn_temporal_kernel=int(uni_cfg.get("temporal_kernel", 5)),
         gcn_adaptive=bool(uni_cfg.get("adaptive", True)),
         gcn_dropout=float(uni_cfg.get("dropout", 0.0)),
-        tokens_per_chunk=int(mcfg.get("tokens_per_chunk", 4)),
+        tokens_per_chunk=tokens_per_chunk,
         llm_dim=int(llm_dim),
-        transformer_layers=int(transformer_cfg.get("layers", 2)),
-        transformer_heads=int(transformer_cfg.get("heads", 4)),
-        transformer_mlp=mlp_dim,
-        transformer_dropout=float(transformer_cfg.get("dropout", 0.1)),
+        sampling_stride=sampling_stride,
     )
     return encoder
 
