@@ -24,9 +24,7 @@ def _slice_pose_by_part(
     pose: torch.Tensor, part_lens: Sequence[int]
 ) -> Sequence[torch.Tensor]:
     if sum(part_lens) != pose.size(2):
-        raise ValueError(
-            "Sum of part_lens must equal the joint dimension of pose."
-        )
+        raise ValueError("Sum of part_lens must equal the joint dimension of pose.")
     return pose.split(tuple(int(l) for l in part_lens), dim=2)
 
 
@@ -47,14 +45,16 @@ def _build_masks(
     pose_len = pose_len.to(device=device, dtype=torch.long)
     chunk_ids = torch.arange(num_chunks, device=device)
     chunk_mask = chunk_ids.unsqueeze(0) < pose_len.unsqueeze(1)  # [B, N]
-    
+
     # Expand chunk mask to frame level
     frame_mask_bool = chunk_mask.view(-1, 1).expand(-1, chunk_len).clone()  # [B*N, T]
 
     # Refine mask for the last valid chunk of each sample
     if last_chunk_valid_len is not None:
         if last_chunk_valid_len.dim() != 1 or last_chunk_valid_len.numel() != batch:
-            raise ValueError("last_chunk_valid_len must be 1D with length equal to batch size.")
+            raise ValueError(
+                "last_chunk_valid_len must be 1D with length equal to batch size."
+            )
         last_chunk_valid_len = last_chunk_valid_len.to(device=device, dtype=torch.long)
         for i in range(batch):
             # Index of the last valid chunk for sample i
@@ -230,7 +230,9 @@ class MultiPartGCNModel(nn.Module):
                 x,
                 mask=valid_mask,
                 return_seq=True,
-            )  # [B, T, D]
+            )  # [B*N, T, D]
+            if feats.dtype != part_pose.dtype:
+                feats = feats.to(part_pose.dtype)
             outputs.append(feats)
 
         features = torch.stack(outputs, dim=1)  # [B, P, T, D]

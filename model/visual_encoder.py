@@ -66,7 +66,6 @@ class VisualEncoder(nn.Module):
         *,
         in_channels: Optional[int] = None,
         device: Optional[torch.device] = None,
-        dtype: Optional[torch.dtype] = None,
     ) -> None:
         if in_channels is None:
             in_channels = 2 if self.multipart.drop_conf else 3
@@ -75,7 +74,6 @@ class VisualEncoder(nn.Module):
             in_channels=in_channels,
             device=device,
         )
-        self.projection.to(dtype)
 
     def forward(
         self,
@@ -167,6 +165,9 @@ class VisualEncoder(nn.Module):
         if frame_mask is not None:
             frame_mask = frame_mask[:, :: self.sampling_stride]
             seq = seq * frame_mask.unsqueeze(-1).to(seq.dtype)
+        proj_dtype = self.projection.weight.dtype
+        if seq.dtype != proj_dtype:
+            seq = seq.to(proj_dtype)
         tokens = self.projection(seq)
         tokens_per_chunk = tokens.size(1)
         if self.tokens_per_chunk is None:
