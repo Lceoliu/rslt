@@ -66,6 +66,7 @@ class VisualEncoder(nn.Module):
         *,
         in_channels: Optional[int] = None,
         device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ) -> None:
         if in_channels is None:
             in_channels = 2 if self.multipart.drop_conf else 3
@@ -74,6 +75,7 @@ class VisualEncoder(nn.Module):
             in_channels=in_channels,
             device=device,
         )
+        self.projection.to(dtype)
 
     def forward(
         self,

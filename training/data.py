@@ -65,7 +65,21 @@ def build_dataloaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, int]
         from dataset.my_dataset import create_dataloader
         from dataset.transform import NormalizeProcessor
 
-        transform = NormalizeProcessor(conf_threshold=cfg.get('data', {}).get('conf_threshold', 0.1))
+        model_parts = cfg.get('model', {}).get('parts')
+        enabled_parts = None
+        if isinstance(model_parts, (list, tuple)):
+            seen = set()
+            deduped = []
+            for part in model_parts:
+                if part not in seen:
+                    deduped.append(part)
+                    seen.add(part)
+            if deduped:
+                enabled_parts = deduped
+        transform = NormalizeProcessor(
+            conf_threshold=cfg.get('data', {}).get('conf_threshold', 0.1),
+            enabled_parts=enabled_parts,
+        )
         train_loader = create_dataloader(
             ds_cfg,
             split='train',

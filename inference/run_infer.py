@@ -28,7 +28,18 @@ def _build_test_loader(cfg: Dict[str, Any], split: str = "test") -> Any:
     assert data_cfg and data_cfg.get("data_dir"), "dataset.data_dir must be provided in config."
     data_cfg['min_reserved_ratio'] = 1.0
     conf_threshold = cfg.get("data", {}).get("conf_threshold", 0.1)
-    transform = NormalizeProcessor(conf_threshold=conf_threshold)
+    model_parts = cfg.get("model", {}).get("parts")
+    enabled_parts = None
+    if isinstance(model_parts, (list, tuple)):
+        seen = set()
+        deduped = []
+        for part in model_parts:
+            if part not in seen:
+                deduped.append(part)
+                seen.add(part)
+        if deduped:
+            enabled_parts = deduped
+    transform = NormalizeProcessor(conf_threshold=conf_threshold, enabled_parts=enabled_parts)
     loader = create_dataloader(
         data_cfg,
         split=split,

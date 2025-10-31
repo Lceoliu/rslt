@@ -5,7 +5,7 @@ import matplotlib
 import av
 import gc
 
-from typing import Literal, Optional, Tuple, List, Dict
+from typing import Literal, Optional, Tuple, List, Dict, Sequence, Set
 from pathlib import Path
 from tqdm import tqdm
 
@@ -20,10 +20,20 @@ class NormalizeProcessor:
         keypoint_format: Literal['COCO_Wholebody'] = 'COCO_Wholebody',
         conf_threshold: float = 0.25,
         add_fullbody_channel: bool = True,
+        enabled_parts: Optional[Sequence[str]] = None,
     ):
         self.keypoint_format = keypoint_format
         self.conf_threshold = conf_threshold
-        self.add_fullbody_channel = add_fullbody_channel
+
+        ordered_parts: Optional[List[str]] = None
+        if enabled_parts is not None:
+            ordered_parts = []
+            seen_parts: Set[str] = set()
+            for name in enabled_parts:
+                if name in seen_parts:
+                    continue
+                ordered_parts.append(str(name))
+                seen_parts.add(str(name))
         try:
             with open(BODY_INFO_PATH, 'r') as f:
                 self.body_info = json.load(f)[self.keypoint_format]
@@ -32,34 +42,61 @@ class NormalizeProcessor:
         except Exception as e:
             raise RuntimeError(f'Error loading body_info.json: {e}')
         self.num_keypoints = self.body_info['NUM_KEYPOINTS']
-        self.center_indices = self.body_info['CENTER_INDICES']
+        base_center_indices = dict(self.body_info['CENTER_INDICES'])
         self.normalize_bone = self.body_info['NORMALIZE_BONE']
-        self.edges = self.body_info['EDGES']
-        self.body_part_intervals = self.body_info['BODY_PARTS_INTERVALS']
+        base_edges = {part: list(edges) for part, edges in self.body_info['EDGES'].items()}
+        base_part_intervals = dict(self.body_info['BODY_PARTS_INTERVALS'])
         self.discarded_keypoints = self.body_info.get('DISCARDED_KEYPOINTS', [])
+
+        if ordered_parts is not None:
+            wants_fullbody = 'fullbody' in ordered_parts
+            if wants_fullbody and not add_fullbody_channel:
+                raise ValueError(
+                    "enabled_parts includes 'fullbody' but add_fullbody_channel=False."
+                )
+            self.add_fullbody_channel = add_fullbody_channel if wants_fullbody else False
+        else:
+            self.add_fullbody_channel = add_fullbody_channel
+
+        if self.add_fullbody_channel:
+            base_part_intervals['fullbody'] = [0, self.num_keypoints]
+            base_center_indices['fullbody'] = 0  # 使用 body 的中心点
+            base_edges['fullbody'] = (
+                base_edges['body']
+                + base_edges['face']
+                + base_edges['left_hand']
+                + base_edges['right_hand']
+            )
+
+        if ordered_parts is not None:
+            missing = [part for part in ordered_parts if part not in base_part_intervals]
+            if missing:
+                raise ValueError(f"enabled_parts contains unknown parts: {missing}")
+            self.body_part_intervals = {part: base_part_intervals[part] for part in ordered_parts}
+            self.center_indices = {part: base_center_indices[part] for part in ordered_parts}
+            self.edges = {part: base_edges[part] for part in ordered_parts}
+            self.body_parts = list(ordered_parts)
+        else:
+            self.body_part_intervals = base_part_intervals
+            self.center_indices = base_center_indices
+            self.edges = base_edges
+            self.body_parts = list(self.body_part_intervals.keys())
+
         self.all_indices = []
-        for interval in self.body_part_intervals.values():
-            self.all_indices.extend(list(range(interval[0], interval[1])))
-        self.all_indices = set(self.all_indices) - set(self.discarded_keypoints)
-        self.all_indices = sorted(list(self.all_indices))
+        non_fullbody_parts = [part for part in self.body_parts if part != 'fullbody']
+        parts_for_index = non_fullbody_parts if non_fullbody_parts else list(self.body_parts)
+        for part in parts_for_index:
+            start, end = self.body_part_intervals[part]
+            self.all_indices.extend(range(start, end))
+        self.all_indices = sorted(set(self.all_indices) - set(self.discarded_keypoints))
 
         self.indices_map = {idx: i for i, idx in enumerate(self.all_indices)}
 
-        if self.add_fullbody_channel:
-            self.body_part_intervals['fullbody'] = [0, self.num_keypoints]
-            self.center_indices['fullbody'] = 0  # 使用 body 的中心点
-            self.edges['fullbody'] = (
-                self.edges['body']
-                + self.edges['face']
-                + self.edges['left_hand']
-                + self.edges['right_hand']
-            )
         self.body_part_start_idx = {
-            part: interval[0] for part, interval in self.body_part_intervals.items()
+            part: self.body_part_intervals[part][0] for part in self.body_parts
         }
-        self.body_parts = list(self.body_part_intervals.keys())
         assert (
-            self.center_indices.keys() == self.body_part_intervals.keys()
+            set(self.center_indices.keys()) == set(self.body_part_intervals.keys())
         ), "CENTER_INDICES and BODY_PART_INTERVALS keys must match"
 
     def gen_adjacency_matrix(

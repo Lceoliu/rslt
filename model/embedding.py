@@ -12,12 +12,11 @@ __all__ = ["build_visual_encoder", "compute_embedding_from_parts"]
 
 
 def _ensure_parts(parts: Sequence[str]) -> Sequence[str]:
-    if "fullbody" in parts:
-        return parts
-    ordered = list(parts) + ["fullbody"]
+    if not parts:
+        return PARTS_DEFAULT
     deduped: list[str] = []
     seen = set()
-    for name in ordered:
+    for name in parts:
         if name not in seen:
             deduped.append(name)
             seen.add(name)
