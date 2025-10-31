@@ -500,7 +500,10 @@ def train(args):
             for k, v in adjacency_init.items()
         }
         engine.module.visual.initialize_backbones(
-            adjacency_init_device, in_channels=channels_hint, device=engine.device
+            adjacency_init_device,
+            in_channels=channels_hint,
+            device=engine.device,
+            dtype=torch.bfloat16,
         )
 
         if dist.is_initialized():

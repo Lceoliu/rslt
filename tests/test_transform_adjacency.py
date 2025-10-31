@@ -111,3 +111,12 @@ def test_split_part_matrices_shapes_and_consistency():
 
     # Right hand: local index = abs - 112
     assert parts['right_hand'][112 - 112, 113 - 112] == 1.0
+
+
+def test_enabled_parts_excludes_fullbody():
+    p = NormalizeProcessor(enabled_parts=['body', 'face'])
+    assert p.body_parts == ['body', 'face']
+    assert p.add_fullbody_channel is False
+    parts = p.gen_adjacency_matrix(split_part=True)
+    assert list(parts.keys()) == ['body', 'face']
+    assert 'fullbody' not in parts
