@@ -1,0 +1,75 @@
+train:
+  seed: 3407
+  profiler: false
+  epochs: 10 
+  log_logits: false
+  log_interval: 50000
+  val_interval: 50000
+  save_dir_root: runs
+  save_every: 50000
+  resume_from: ''
+  visual_lr: 1e-5 
+  llm_lr: 1e-6
+
+dataset:
+  data_dirs: /2023234331/data/csl_news
+  have_sub_dirs: true
+  seed: 3407
+  # --- 关键改动：开启并加强数据增强 ---
+  augmentations: 'speed,mask'
+  aug_prob: 0.5
+  aug_speed_min: 0.8
+  aug_speed_max: 1.2
+  aug_mask_prob: 0.15
+  pad_last: true
+  min_reserved_ratio: 1.0
+  window: 32
+  stride: 32
+
+data:
+  batch_size: 8
+  num_workers: 4
+  conf_threshold: 0.1
+  T: 32
+  train_length: 256
+  val_length: 128
+
+model:
+  parts:
+  - body
+  - face
+  - left_hand
+  - right_hand
+  drop_conf: true
+  part_embed_dim: 256
+  tokens_per_chunk: 0 
+  uni_gcn:
+    proj_dim: 256
+    temporal_kernel: 7
+    adaptive: true
+    dropout: 0.1 # 略微增加GCN的dropout
+    temporal_sampling_stride: 1
+
+llm:
+  model_name_or_path: /workspace/Qwen
+  trust_remote_code: true
+  max_text_len: 128
+  freeze_lm: false
+  gradient_checkpointing: false
+  boc_token: <BOC>
+  eoc_token: <EOC>
+  bot_token: <BOT>
+  eot_token: <EOT>
+  contrastive_tau: 0.08
+  contrastive_neg_k: 256
+  contrastive_projection_dim: 256 # Dimension of the contrastive projection head
+  # --- 关键改动：同时使用对比损失和多样性损失 ---
+  contrastive_alpha: 0.0 # TODO: 调整对比损失权重
+  diversity_alpha: 0.0   # TODO: 调整多样性损失权重
+  compute_special_token_loss: false # TODO: 是否计算特殊token的损失
+
+decoding:
+  max_new_tokens: 64
+  do_sample: true
+  temperature: 0.3
+  top_k: 15

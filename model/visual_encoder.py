@@ -96,60 +96,21 @@ class VisualEncoder(nn.Module):
         Returns:
             chunk_tokens: [B, N_chunk, tokens_per_chunk, llm_dim]
             token_mask: [B, N_chunk, tokens_per_chunk] bool mask
+            chunk_mask: [B, N_chunk] bool mask
         """
 
         batch_size, num_chunks, chunk_len, total_joints, channels = pose.shape
         # pdb.set_trace()
         # features: [B*N_chunk, Parts, chunk_len, gcn_embed_dim]
         # frame_mask: [B*N_chunk, chunk_len]， 代表每一帧是否有效
-        features = []
-        frame_mask = []
-        for i in range(num_chunks):
-            chunk = pose[:, i, :, :, :]
-            valid_mask = torch.zeros(
-                batch_size, chunk_len, dtype=torch.bool, device=pose.device
-            )
-            for b in range(batch_size):
-                valid_chunk_count = pose_len[b] if pose_len is not None else num_chunks
-                if i >= valid_chunk_count:
-                    valid_len = 0
-                elif (i == valid_chunk_count - 1) and (
-                    last_chunk_valid_len is not None
-                ):
-                    valid_len = last_chunk_valid_len[b]
-                else:
-                    valid_len = chunk_len
-                valid_mask[b, :valid_len] = 1
-            feature = self.multipart(
-                chunk,
-                part_lens=part_lens,
-                valid_mask=valid_mask,
-                adjacency=adjacency,
-            )
-            features.append(feature)  # N_chunks * [B, P, chunk_len, gcn_embed_dim]
-            if valid_mask is not None:
-                frame_mask.append(valid_mask)  # N_chunks * [B, chunk_len]
-            else:
-                frame_mask.append(
-                    torch.ones(
-                        batch_size, chunk_len, dtype=torch.bool, device=pose.device
-                    )
-                )
-        features = torch.stack(
-            features, dim=1
-        )  # [B, N_chunk, P, chunk_len, gcn_embed_dim]
-        features = features.view(
-            batch_size * num_chunks,
-            features.size(2),
-            features.size(3),
-            features.size(4),
-        )  # [B*N_chunk, P, chunk_len, gcn_embed_dim]
-        frame_mask = torch.stack(frame_mask, dim=1)  # [B, N_chunk, chunk_len]
-        frame_mask = frame_mask.view(
-            batch_size * num_chunks,
-            frame_mask.size(2),
-        )  # [B*N_chunk, chunk_len]
-
+        # chunk_mask: [B, N_chunk]， 代表每一个chunk是否有效
+        features, frame_mask, chunk_mask = self.multipart(
+            pose,
+            part_lens=part_lens,
+            pose_len=pose_len,
+            last_chunk_valid_len=last_chunk_valid_len,
+            adjacency=adjacency,
+        )
         bn, part_count, _, embed_dim = _reshape_features(features)
         # seq: [B*N_chunk, chunk_len, Parts * gcn_embed_dim]
         seq = (
@@ -188,7 +149,9 @@ class VisualEncoder(nn.Module):
             batch_size, num_chunks, self.tokens_per_chunk, self.llm_dim
         )
         if frame_mask is not None:
-            token_mask = frame_mask.view(batch_size, num_chunks, self.tokens_per_chunk)
+            token_mask = frame_mask.view(
+                batch_size, num_chunks, self.tokens_per_chunk
+            )
         else:
             token_mask = torch.ones(
                 batch_size,

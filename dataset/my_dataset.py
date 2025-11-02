@@ -43,6 +43,7 @@ class MyDataset(Dataset):
         self.min_reserved_ratio = self.config.get('min_reserved_ratio', 0.6)
         self._base_seed = int(self.config.get('seed', 3407))
         self._epoch = 0
+        self._start_iter = 0
         self.pad_last = self.config.get('pad_last', True)
         self.window = self.config.get('window', 32)
         self.stride = self.config.get('stride', 16)
@@ -330,6 +331,10 @@ class MyDataset(Dataset):
     def set_epoch(self, epoch: int) -> None:
         """Allow the caller to update the epoch for RNG derivation."""
         self._epoch = int(epoch)
+
+    def set_start_iter(self, start_iter: int) -> None:
+        """Set the starting iteration for the sampler."""
+        self._start_iter = int(start_iter)
 
     def _make_rng(self, idx: int) -> np.random.Generator:
         worker_info = torch.utils.data.get_worker_info()

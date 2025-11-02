@@ -15,7 +15,7 @@ if ENABLE_DEBUG:
 
 
 import argparse
-import os, sys, random, logging, time
+import os, sys, random, logging, time, itertools
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Sequence, Optional
@@ -361,7 +361,7 @@ class VLLMTrainer(nn.Module):
         )
         adjacency = {k: v.to(device) for k, v in adjacency.items()}
 
-        tokens, token_mask = self.visual(
+        tokens, token_mask, _ = self.visual(
             pose,
             part_lens=part_lens,
             pose_len=pose_len,
@@ -597,12 +597,13 @@ def train(args):
 
     global_step = 0
     start_epoch = 0
+    resume_step_in_epoch = 0
     if resume_from:
-        if ckpt_tag == '':
-            ckpt_tag = None  # load latest
-        print(f"Loading checkpoint from {ckpt_dir}, tag: {ckpt_tag or 'latest'}")
+        if ckpt_tag is None or ckpt_tag == 'None':
+            ckpt_tag = 'latest'
+        print(f"Loading checkpoint from {ckpt_dir}, tag: {ckpt_tag}")
         load_kwargs = {
-            'tag': ckpt_tag,
+            'tag': None if ckpt_tag == 'latest' else ckpt_tag,
             'load_module_strict': not resume_for_new_stage,
             'load_optimizer_states': not resume_for_new_stage,
             'load_lr_scheduler_states': not resume_for_new_stage,
@@ -678,13 +679,27 @@ def train(args):
         if isinstance(client_sd, dict):
             global_step = int(client_sd.get('global_step', 0))
             start_epoch = int(client_sd.get('epoch', 0))
+            # Calculate how many steps into the epoch we are.
+            steps_per_epoch = max(1, len(train_loader) // acc_steps)
+            resume_step_in_epoch = global_step % steps_per_epoch
+            if resume_step_in_epoch > 0:
+                print(
+                    f"Resuming from within an epoch. Will skip {resume_step_in_epoch} steps."
+                )
+
+            print(
+                f"Resumed global_step: {global_step}, start_epoch: {start_epoch}"
+            )
+        else:
+            print(
+                "========Warning: client_sd is not a dict. Cannot extract global_step and epoch.=========="
+            )
+            print(client_sd)
 
         ckpt_dir = run_dir / 'checkpoints'  # do not overwrite old checkpoints
 
         if not ckpt_dir.exists():
             ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    # No need to call net.to(device) - DeepSpeed manages device placement
 
     # Manual LR scheduling for differential learning rates
     def update_learning_rate(step, warmup_steps, total_steps, base_lrs):
@@ -738,9 +753,29 @@ def train(args):
         if hasattr(train_loader.dataset, 'set_epoch'):
             train_loader.dataset.set_epoch(epoch)
         engine.train()
-        iterable = train_loader
-        if engine.global_rank == 0 and tqdm is not None:
-            iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
+        
+        # Skip steps if resuming from mid-epoch
+        if resume_step_in_epoch > 0:
+            if hasattr(train_loader.sampler, 'set_epoch'):
+                # This is for DistributedSampler to correctly set the start point
+                if hasattr(train_loader.dataset, 'set_start_iter'):
+                    train_loader.dataset.set_start_iter(resume_step_in_epoch)
+            
+            iterable = itertools.islice(train_loader, resume_step_in_epoch, None)
+            if engine.global_rank == 0 and tqdm is not None:
+                iterable = tqdm(
+                    iterable,
+                    desc=f'train epoch {epoch}',
+                    leave=False,
+                    initial=resume_step_in_epoch,
+                    total=len(train_loader),
+                )
+            resume_step_in_epoch = 0  # Only skip for the first epoch of resumption
+        else:
+            iterable = train_loader
+            if engine.global_rank == 0 and tqdm is not None:
+                iterable = tqdm(train_loader, desc=f'train epoch {epoch}', leave=False)
+
         for step, batch in enumerate(iterable):
             if use_profiler:
                 step_start = time.time()
