@@ -116,14 +116,11 @@ print(f"Total fail: {error_results['total_fail_ratio']:.1f}%")
 
 ### 5. Special Token Analysis (`special_tokens.py`)
 
-**Purpose**: Check if special tokens learned distinct meanings.
+**Purpose**: (Deprecated) Earlier revisions used dedicated <BOC>/<EOC>/<BOT>/<EOT> tokens.
 
-**Analysis**: Compute cosine similarity between `<BOC>`, `<EOC>`, `<BOT>`, `<EOT>`.
+**Analysis**: The current prompt-prefix design no longer exposes those special tokens; the helper now reports that the check is not applicable.
 
-**Expected**:
-- BOC ≈ EOC (both are chunk boundaries)
-- BOT ≈ EOT (both are text boundaries)
-- Chunk tokens ≠ Text tokens (cross-similarity < 0.6)
+**Expected**: N/A
 
 ## Example Report Output
 

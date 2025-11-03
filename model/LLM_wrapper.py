@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple, Optional
 
 import torch
 import torch.nn as nn
-import pdb
 
 
 class LLMWithVisualPrefix(nn.Module):
-    """Wrap a Hugging Face CausalLM to accept visual chunk embeddings."""
+    """Wrap a Hugging Face CausalLM to accept visual token embeddings with a prompt prefix."""
 
     def __init__(
         self,
@@ -18,12 +17,9 @@ class LLMWithVisualPrefix(nn.Module):
         max_text_len: int = 128,
         gradient_checkpointing: bool = False,
         freeze_lm: bool = False,
-        boc_token: str = "<BOC>",
-        eoc_token: str = "<EOC>",
-        bot_token: str = "<BOT>",
-        eot_token: str = "<EOT>",
         verbose: bool = False,
         compute_special_token_loss: bool = False,
+        prompt_text: str = "\u8bf7\u5c06\u63a5\u4e0b\u6765\u7684\u624b\u8bed\u5185\u5bb9\u7ffb\u8bd1\u6210\u6587\u5b57\uff1a",
     ) -> None:
         super().__init__()
         try:
@@ -37,37 +33,26 @@ class LLMWithVisualPrefix(nn.Module):
             model_name_or_path,
             trust_remote_code=trust_remote_code,
         )
-        original_tokenizer_size = len(self.tokenizer)
         if self.tokenizer.pad_token_id is None:
             print("Using eos token as padding token!")
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.verbose = verbose
-        self.compute_special_token_loss = compute_special_token_loss
-        self.special_tokens = {
-            "boc": boc_token,
-            "eoc": eoc_token,
-            "bot": bot_token,
-            "eot": eot_token,
-        }
-        self.tokenizer.add_special_tokens(
-            {"additional_special_tokens": list(self.special_tokens.values())}
-        )
+        self.prompt_text = prompt_text
+        self._prompt_ids: Optional[torch.Tensor] = None
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
             trust_remote_code=trust_remote_code,
         )
-        self.model.resize_token_embeddings(len(self.tokenizer))
         if self.verbose:
             print(
-                f"Loaded LLM: {model_name_or_path}, tokenizer size {original_tokenizer_size} -> {len(self.tokenizer)}"
+                f"Loaded LLM: {model_name_or_path}, tokenizer size {len(self.tokenizer)}"
             )
         if gradient_checkpointing and hasattr(self.model, "gradient_checkpointing_enable"):
             self.model.gradient_checkpointing_enable()
         if freeze_lm:
             for param in self.model.parameters():
                 param.requires_grad = False
-            # ensure embeddings are frozen too
             if hasattr(self.model, "get_input_embeddings"):
                 self.model.get_input_embeddings().weight.requires_grad = False
 
@@ -80,10 +65,7 @@ class LLMWithVisualPrefix(nn.Module):
         self.hidden_size = int(hidden_size)
 
         self.max_text_len = int(max_text_len)
-        self._special_ids = {
-            name: self.tokenizer.convert_tokens_to_ids(token)
-            for name, token in self.special_tokens.items()
-        }
+        self.compute_special_token_loss = compute_special_token_loss  # kept for config compatibility
 
     @property
     def device(self) -> torch.device:
@@ -98,58 +80,58 @@ class LLMWithVisualPrefix(nn.Module):
         """
         Compute autoregressive loss given chunk embeddings and texts.
 
-        chunk_tokens: [B, N, P, E], where B is batch size, N is number of chunks, P is tokens per chunk, E is embedding dimension
-        token_mask: [B, N, P] bool
-        texts: List of length B
+        chunk_tokens: [B, N, T, E]
+        token_mask: [B, N, T] bool
+        texts: List[str] with length B
         """
-
         if chunk_tokens.dim() != 4:
-            raise ValueError("chunk_tokens must be [B, N, P, E].")
+            raise ValueError("chunk_tokens must be [B, N, T, E].")
         if token_mask.shape != chunk_tokens.shape[:3]:
             raise ValueError("token_mask must match chunk_tokens batch/length dims.")
         if len(texts) != chunk_tokens.size(0):
             raise ValueError("texts length must equal batch size.")
 
-        if self.verbose:
-            print(f"Texts: {texts}")
-
-        model_dtype = self.model.get_input_embeddings().weight.dtype
+        embed_layer = self.model.get_input_embeddings()
+        model_dtype = embed_layer.weight.dtype
         chunk_tokens = chunk_tokens.to(model_dtype)
         token_mask = token_mask.to(torch.bool)
 
-        special_embeds = self._get_special_embeddings(device=chunk_tokens.device)
-        embed_layer = self.model.get_input_embeddings()
+        batch_size, num_chunks, tokens_per_chunk, embed_dim = chunk_tokens.shape
+        flat_tokens = chunk_tokens.reshape(batch_size, num_chunks * tokens_per_chunk, embed_dim)
+        flat_mask = token_mask.reshape(batch_size, num_chunks * tokens_per_chunk)
+
+        prompt_embeds = self._get_prompt_embeddings(device=chunk_tokens.device)
+        eos_id = self.tokenizer.eos_token_id
+        eos_embed = embed_layer(torch.tensor([eos_id], device=chunk_tokens.device))
 
         seq_embeds: List[torch.Tensor] = []
         seq_labels: List[torch.Tensor] = []
-        for chunk_embed, mask, text in zip(chunk_tokens, token_mask, texts):
-            # chunk_embed: [N, P, E], mask: [N, P], N为chunk数量，P为Token_Per_chunk数量，E为embedding维度
-            prefix_embeds, prefix_ids = self._build_prefix(
-                chunk_embed,
-                mask,
-                embed_layer,
-                special_embeds,
-            )
-            # pdb.set_trace()
-            text_ids = self._tokenize_text(text)
-            text_embeds = embed_layer(text_ids.unsqueeze(0)).squeeze(0)
-            eot_embed = special_embeds["eot"]
 
-            seq = torch.cat([prefix_embeds, text_embeds, eot_embed], dim=0)
-            labels = torch.cat(
-                [
-                    self._prefix_labels_from_ids(prefix_ids),
-                    text_ids.to(prefix_ids.device),
-                    torch.tensor([self._special_ids["eot"]], device=prefix_ids.device),
-                ]
+        for visual_embed, visual_mask, text in zip(flat_tokens, flat_mask, texts):
+            valid_visual = visual_embed[visual_mask]
+            prefix_embeds = torch.cat([prompt_embeds, valid_visual], dim=0)
+            prefix_labels = torch.full(
+                (prefix_embeds.size(0),),
+                fill_value=-100,
+                dtype=torch.long,
+                device=chunk_tokens.device,
             )
+
+            text_ids = self._tokenize_text(text).to(chunk_tokens.device)
+            text_embeds = embed_layer(text_ids.unsqueeze(0)).squeeze(0)
+
+            seq = torch.cat([prefix_embeds, text_embeds, eos_embed], dim=0)
+            text_labels = torch.cat(
+                [text_ids, torch.tensor([eos_id], device=chunk_tokens.device)]
+            )
+            labels = torch.cat([prefix_labels, text_labels], dim=0)
             if labels.numel() > 0:
-                labels[0] = -100  # first token has no target
+                labels[0] = -100
+
             seq_embeds.append(seq)
             seq_labels.append(labels)
 
         inputs_embeds, attention_mask, labels = self._pad_sequences(seq_embeds, seq_labels)
-        # pdb.set_trace()
         outputs = self.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -169,31 +151,27 @@ class LLMWithVisualPrefix(nn.Module):
         top_k: int = 10,
     ) -> List[str]:
         if chunk_tokens.dim() != 4:
-            raise ValueError("chunk_tokens must be [B, N, P, E].")
+            raise ValueError("chunk_tokens must be [B, N, T, E].")
         if token_mask.shape != chunk_tokens.shape[:3]:
             raise ValueError("token_mask must match chunk_tokens batch/length dims.")
 
-        model_dtype = self.model.get_input_embeddings().weight.dtype
+        embed_layer = self.model.get_input_embeddings()
+        model_dtype = embed_layer.weight.dtype
         chunk_tokens = chunk_tokens.to(model_dtype)
         token_mask = token_mask.to(torch.bool)
-        # pdb.set_trace()
 
-        special_embeds = self._get_special_embeddings(device=chunk_tokens.device)
-        embed_layer = self.model.get_input_embeddings()
+        batch_size, num_chunks, tokens_per_chunk, embed_dim = chunk_tokens.shape
+        flat_tokens = chunk_tokens.reshape(batch_size, num_chunks * tokens_per_chunk, embed_dim)
+        flat_mask = token_mask.reshape(batch_size, num_chunks * tokens_per_chunk)
+
+        prompt_embeds = self._get_prompt_embeddings(device=chunk_tokens.device)
+        eos_id = self.tokenizer.eos_token_id
 
         prefix_embeds_list: List[torch.Tensor] = []
-        prefix_id_list: List[torch.Tensor] = []
-        for chunk_embed, mask in zip(chunk_tokens, token_mask):
-            prefix_embeds, prefix_ids = self._build_prefix(
-                chunk_embed,
-                mask,
-                embed_layer,
-                special_embeds,
-            )
-            prefix_embeds_list.append(prefix_embeds)
-            prefix_id_list.append(prefix_ids)
-        if self.verbose:
-            print(f"prefix ids: {prefix_id_list}")
+        for visual_embed, visual_mask in zip(flat_tokens, flat_mask):
+            valid_visual = visual_embed[visual_mask]
+            prefix = torch.cat([prompt_embeds, valid_visual], dim=0)
+            prefix_embeds_list.append(prefix)
 
         inputs_embeds, attention_mask, lengths = self._pad_prefixes(prefix_embeds_list)
 
@@ -204,82 +182,52 @@ class LLMWithVisualPrefix(nn.Module):
             do_sample=do_sample,
             temperature=temperature,
             top_k=top_k,
-            eos_token_id=self._special_ids["eot"],
+            eos_token_id=eos_id,
             pad_token_id=self.tokenizer.pad_token_id,
             repetition_penalty=1.5,
         )
 
         results: List[str] = []
         for seq, prefix_len in zip(sequences, lengths.tolist()):
-            gen_tokens = seq[:]
-            eot_id = self._special_ids["eot"]
-            if (gen_tokens == eot_id).any():
-                stop = torch.nonzero(gen_tokens == eot_id, as_tuple=False)[0].item()
+            gen_tokens = seq[prefix_len:]
+            if eos_id is not None and (gen_tokens == eos_id).any():
+                stop = torch.nonzero(gen_tokens == eos_id, as_tuple=False)[0].item()
                 gen_tokens = gen_tokens[:stop]
             text = self.tokenizer.decode(gen_tokens.tolist(), skip_special_tokens=True)
             results.append(text)
         return results
 
-    def _build_prefix(
-        self,
-        chunk_embed: torch.Tensor,
-        mask: torch.Tensor,
-        embed_layer: nn.Embedding,
-        special_embeds: Dict[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        chunk_embed: [N, P, E]
-        mask: [N, P] bool
-        Returns:
-            prefix: [L, E], 包含 <BOC> chunk1 <EOC> <BOC> chunk2 <EOC> ... <BOT>
-            prefix_ids: [L] (-1 for non-token positions)
-        """
-        parts: List[torch.Tensor] = []
-        token_ids: List[int] = []
-        for chunk_vecs, chunk_mask in zip(chunk_embed, mask):
-            # chunk_vecs: [P, E], chunk_mask: [P]
-            valid_idx = torch.nonzero(chunk_mask, as_tuple=False).squeeze(-1)
-            if valid_idx.numel() == 0:
-                continue
-            parts.append(special_embeds["boc"])
-            token_ids.append(self._special_ids["boc"])
-            selected = chunk_vecs.index_select(0, valid_idx)
-            parts.append(selected)
-            token_ids.extend([-1] * selected.size(0))
-            parts.append(special_embeds["eoc"])
-            token_ids.append(self._special_ids["eoc"])
-        parts.append(special_embeds["bot"])
-        token_ids.append(self._special_ids["bot"])
-        prefix = torch.cat(parts, dim=0)
-        token_ids_tensor = torch.tensor(token_ids, dtype=torch.long, device=prefix.device)
-        return prefix, token_ids_tensor
+    def _get_prompt_ids(self) -> torch.Tensor:
+        if self._prompt_ids is None:
+            encoded = self.tokenizer(
+                self.prompt_text,
+                add_special_tokens=False,
+                truncation=True,
+                max_length=self.max_text_len,
+                return_tensors="pt",
+            )
+            prompt_ids = encoded["input_ids"][0]
+            if prompt_ids.numel() == 0:
+                prompt_ids = torch.tensor([self.tokenizer.eos_token_id], dtype=torch.long)
+            self._prompt_ids = prompt_ids
+        return self._prompt_ids
 
-    def _prefix_labels_from_ids(self, prefix_ids: torch.Tensor) -> torch.Tensor:
-        if self.compute_special_token_loss:
-            labels = prefix_ids.clone()
-            labels[labels == -1] = -100
-            return labels
-        # Ignore all prefix tokens by setting their labels to -100.
-        # The model should only be trained to predict the text tokens.
-        return torch.full_like(prefix_ids, -100)
+    def _get_prompt_embeddings(self, device: torch.device) -> torch.Tensor:
+        prompt_ids = self._get_prompt_ids().to(device)
+        embed_layer = self.model.get_input_embeddings()
+        return embed_layer(prompt_ids.unsqueeze(0)).squeeze(0)
 
     def _pad_prefixes(
         self,
         embeds: Sequence[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        把不同长度的embeddings转化到右padding的形式
-
-        Input: embeds: List of [L_i, E] tensors
-
-        Output: padded_embeds: [B, L_max, E]
-                attention_mask: [B, L_max] (1 for valid, 0 for padding)
-                lengths: [B] lengths of each sequence
+        Pad variable-length prefix embeddings to a batch tensor.
         """
-        max_len = max(seq.size(0) for seq in embeds)
+        max_len = max(seq.size(0) for seq in embeds) if embeds else 1
         batch = len(embeds)
-        device = embeds[0].device
-        dtype = embeds[0].dtype
+        device = embeds[0].device if embeds else torch.device("cpu")
+        dtype = embeds[0].dtype if embeds else torch.float32
 
         padded_embeds = torch.zeros(
             batch,
@@ -287,7 +235,7 @@ class LLMWithVisualPrefix(nn.Module):
             self.hidden_size,
             dtype=dtype,
             device=device,
-        )  # [B, L_max, E]
+        )
         attention = torch.zeros(batch, max_len, dtype=torch.long, device=device)
         lengths = torch.zeros(batch, dtype=torch.long, device=device)
         for idx, seq in enumerate(embeds):
@@ -296,88 +244,6 @@ class LLMWithVisualPrefix(nn.Module):
             attention[idx, :length] = 1
             lengths[idx] = length
         return padded_embeds, attention, lengths
-
-    def _pad_prefix_token_ids(
-        self,
-        token_id_list: Sequence[torch.Tensor],
-        lengths: torch.Tensor,
-    ) -> torch.Tensor:
-        pad_id = self.tokenizer.pad_token_id
-        max_len = int(lengths.max().item())
-        batch = len(token_id_list)
-        ids = torch.full(
-            (batch, max_len),
-            fill_value=pad_id,
-            dtype=torch.long,
-            device=lengths.device,
-        )
-        for idx, token_ids in enumerate(token_id_list):
-            padded = torch.where(token_ids == -1, torch.full_like(token_ids, pad_id), token_ids)
-            ids[idx, : token_ids.numel()] = padded
-        return ids
-
-    def _tokenize_text(self, text: str) -> torch.Tensor:
-        """
-        Input: text string
-        Output: token ids tensor [L]
-        """
-        encoded = self.tokenizer(
-            text,
-            add_special_tokens=False,
-            truncation=True,
-            max_length=self.max_text_len,
-            return_tensors="pt",
-        )
-        return encoded["input_ids"][0].to(self.device)
-
-    def get_texts_ids(self, texts: Sequence[str]) -> Sequence[torch.Tensor]:
-        """
-        Input: List of text strings
-        Output: List of token ids tensors [L_i]
-        """
-        return [self._tokenize_text(text) for text in texts]
-
-    def get_id_embeddings(
-        self,
-        ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Input: token ids tensor [L]
-        Output: token embeddings tensor [L, E]
-        """
-        embed_layer = self.model.get_input_embeddings()
-        return embed_layer(ids)
-
-    def sample_negative_embeddings(
-        self,
-        num_samples: int,
-        positive_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Sample negative token embeddings from the vocabulary.
-
-        Input: num_samples: number of negative samples to draw
-               positive_ids: tensor of positive token ids [L]
-        Output: token embeddings tensor [num_samples, E]
-        """
-        vocab_size = self.model.config.vocab_size
-        device = self.device
-        dtype = self.model.get_input_embeddings().weight.dtype
-
-        random_ids = torch.randint(0, vocab_size, (num_samples,), device=device)
-
-        # Create mask to filter out positive IDs using broadcasting
-        # positive_ids: [L], random_ids: [num_samples]
-        # Expand to [num_samples, L] and [num_samples, L] for comparison
-        mask = (random_ids.unsqueeze(1) == positive_ids.unsqueeze(0)).any(dim=1)
-        negative_ids = random_ids[~mask]
-
-        if negative_ids.numel() < num_samples:
-            # If not enough negative samples, fallback to random sampling
-            negative_ids = torch.randint(0, vocab_size, (num_samples,), device=device)
-
-        embeds = self.get_id_embeddings(negative_ids)
-        return embeds.to(dtype)
 
     def _pad_sequences(
         self,
@@ -415,22 +281,45 @@ class LLMWithVisualPrefix(nn.Module):
             attention[idx, :length] = 1
         return padded_embeds, attention, padded_labels
 
-    def _get_special_embeddings(self, device: torch.device) -> Dict[str, torch.Tensor]:
-        embed_layer = self.model.get_input_embeddings()
-        ids = torch.tensor(
-            [
-                self._special_ids["boc"],
-                self._special_ids["eoc"],
-                self._special_ids["bot"],
-                self._special_ids["eot"],
-            ],
-            device=device,
+    def _tokenize_text(self, text: str) -> torch.Tensor:
+        """
+        Input: text string
+        Output: token ids tensor [L]
+        """
+        encoded = self.tokenizer(
+            text,
+            add_special_tokens=False,
+            truncation=True,
+            max_length=self.max_text_len,
+            return_tensors="pt",
         )
-        embeds = embed_layer(ids)
-        embeds = embeds.to(embed_layer.weight.dtype)
-        return {
-            "boc": embeds[0:1],
-            "eoc": embeds[1:2],
-            "bot": embeds[2:3],
-            "eot": embeds[3:4],
-        }
+        return encoded["input_ids"][0].to(self.device)
+
+    def get_texts_ids(self, texts: Sequence[str]) -> Sequence[torch.Tensor]:
+        return [self._tokenize_text(text) for text in texts]
+
+    def get_id_embeddings(
+        self,
+        ids: torch.Tensor,
+    ) -> torch.Tensor:
+        embed_layer = self.model.get_input_embeddings()
+        return embed_layer(ids)
+
+    def sample_negative_embeddings(
+        self,
+        num_samples: int,
+        positive_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        vocab_size = self.model.config.vocab_size
+        device = self.device
+        dtype = self.model.get_input_embeddings().weight.dtype
+
+        random_ids = torch.randint(0, vocab_size, (num_samples,), device=device)
+        mask = (random_ids.unsqueeze(1) == positive_ids.unsqueeze(0)).any(dim=1)
+        negative_ids = random_ids[~mask]
+
+        if negative_ids.numel() < num_samples:
+            negative_ids = torch.randint(0, vocab_size, (num_samples,), device=device)
+
+        embeds = self.get_id_embeddings(negative_ids)
+        return embeds.to(dtype)

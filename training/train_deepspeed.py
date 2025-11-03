@@ -77,11 +77,11 @@ class VLLMTrainer(nn.Module):
             max_text_len=max_text_len,
             gradient_checkpointing=gradient_checkpointing,
             freeze_lm=self.freeze_lm,
-            boc_token=llm_cfg.get('boc_token', '<BOC>'),
-            eoc_token=llm_cfg.get('eoc_token', '<EOC>'),
-            bot_token=llm_cfg.get('bot_token', '<BOT>'),
-            eot_token=llm_cfg.get('eot_token', '<EOT>'),
             verbose=verbose,
+            prompt_text=llm_cfg.get(
+                'prompt_text',
+                "请将接下来的手语内容翻译成文字：",
+            ),
         )
         self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
         print(f"LLM hidden size: {self.llm.hidden_size}")
@@ -589,7 +589,7 @@ def train(args):
 
     epochs = int(train_cfg.get('epochs', args.epochs))
     log_interval = int(train_cfg.get('log_interval', 1000))
-    log_logits = bool(train_cfg.get('log_logits', True))
+    log_logits_enabled = bool(train_cfg.get('log_logits', True))
     val_interval = int(train_cfg.get('val_interval', 500))
     save_every = int(train_cfg.get('save_every', 0))  # 0 disables periodic save
     ckpt_tag = str(train_cfg.get('ckpt_tag', None)).strip()
@@ -855,7 +855,7 @@ def train(args):
             if (
                 engine.global_rank == 0
                 and (global_step % log_interval == 0)
-                and log_logits
+                and log_logits_enabled
             ):
                 loss_val = loss.item()
                 if tqdm is None:

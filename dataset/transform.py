@@ -144,58 +144,61 @@ class NormalizeProcessor:
         generate_video: bool = False,
         save_video_path: Optional[Path] = None,
     ) -> Dict[str, np.ndarray]:
-        """Normalize keypoints.
+        """Normalize keypoints using a UNI-SIGN style crop-and-scale.
 
         Args:
-            keypoints (np.ndarray): Keypoints to normalize. Shape (T, 134, 3)
-            concat_velocity (bool, optional): Whether to concatenate velocity. Defaults to False.
-            concat_acceleration (bool, optional): Whether to concatenate acceleration. Defaults to False.
+            keypoints (np.ndarray): Keypoints to normalize. Shape (T, 134, 3).
 
         Returns:
-            Dict[str, np.ndarray]: Normalized keypoints by body part. And optionally video frames if generate_video is True.
+            Dict[str, np.ndarray]: Normalized keypoints by body part.
         """
-        W, H = keypoints[0, 0, 0], keypoints[0, 0, 1]
         keypoints = keypoints[:, 1:, :]  # (T, 133, 3)
         self.keypoints = keypoints
-        splited_kpts = self._split_to_parts()  # Dict[str, (T, K, 3)]
-        splited_kpts = {
-            k: NormalizeProcessor.interpolate_low_confidence_linear(
-                v, self.conf_threshold
+        part_kpts = self._split_to_parts()
+        part_kpts = {
+            name: NormalizeProcessor.interpolate_low_confidence_linear(
+                arr, self.conf_threshold
             )[0]
-            for k, v in splited_kpts.items()
-            if v is not None
+            for name, arr in part_kpts.items()
+            if arr is not None
         }
-        if generate_video:
-            self.visualize_keypoints(
-                splited_kpts,
-                # original_size=(W, H),
-                edges=self.edges,
-                body_part_start_idx=self.body_part_start_idx,
-                keep_indices=self.all_indices,
-                save_path=TEST_OUTPUT_DIR / 'keypoints_visualization_interpolated.mp4',
-            )
-        splited_kpts = self._centralize(splited_kpts)  # 中心化
-        if generate_video:
-            self.visualize_keypoints(
-                splited_kpts,
-                # original_size=(W, H),
-                edges=self.edges,
-                body_part_start_idx=self.body_part_start_idx,
-                keep_indices=self.all_indices,
-                save_path=TEST_OUTPUT_DIR / 'keypoints_visualization_centralized.mp4',
-            )
-        splited_kpts = self._bone_normalize(splited_kpts, unit_length=8.0)  # 骨骼归一化
 
-        if generate_video:
-            self.visualize_keypoints(
-                splited_kpts,
-                edges=self.edges,
-                body_part_start_idx=self.body_part_start_idx,
-                keep_indices=self.all_indices,
-                save_path=save_video_path / 'keypoints_visualization_normalized.mp4',
-            )
-        splited_kpts = self._discard_keypoints(splited_kpts)  # 舍弃部分关键点
-        return splited_kpts
+        normalized_parts: Dict[str, np.ndarray] = {}
+        scale = 0.0
+        crop_origin = np.zeros(2, dtype=np.float32)
+
+        if 'body' in part_kpts:
+            body_norm, scale, crop_origin = self._normalize_body(part_kpts['body'])
+            normalized_parts['body'] = body_norm
+        else:
+            for candidate in part_kpts.values():
+                _, scale, crop_origin = self._crop_and_scale(candidate)
+                if scale > 0:
+                    break
+
+        for name, arr in part_kpts.items():
+            if name == 'body':
+                continue
+            if name == 'fullbody':
+                normalized_parts[name] = self._apply_global_transform(
+                    arr, scale, crop_origin
+                )
+            elif name in ('left_hand', 'right_hand'):
+                normalized_parts[name] = self._normalize_local_part(
+                    arr, scale, anchor_index=0
+                )
+            else:
+                anchor_abs = self.center_indices.get(name)
+                if anchor_abs is None or name not in self.body_part_start_idx:
+                    anchor_idx = None
+                else:
+                    anchor_idx = anchor_abs - self.body_part_start_idx[name]
+                normalized_parts[name] = self._normalize_local_part(
+                    arr, scale, anchor_index=anchor_idx
+                )
+
+        normalized_parts = self._discard_keypoints(normalized_parts)
+        return normalized_parts
 
     def _discard_keypoints(
         self, splited_kpts: Dict[str, np.ndarray]
@@ -220,62 +223,79 @@ class NormalizeProcessor:
             processed_kpts[part] = kpts[:, indices, :]
         return processed_kpts
 
-    def _bone_normalize(
-        self, splited_kpts: Dict[str, np.ndarray], unit_length: float = 1.0
-    ) -> Dict[str, np.ndarray]:
-        """Normalize keypoints by the length of a specific bone.
+    def _normalize_body(self, body: np.ndarray) -> Tuple[np.ndarray, float, np.ndarray]:
+        body_norm, scale, crop_origin = self._crop_and_scale(body)
+        body_norm = self._mask_low_confidence(body_norm)
+        return body_norm.astype(np.float32), float(scale), crop_origin.astype(np.float32)
 
-        Args:
-            splited_kpts (Dict[str, np.ndarray]): Keypoints split by body part. Each value has shape (T, K, 3).
-            unit_length (float, optional): Desired length of the normalization bone. Defaults to 1.0.
+    def _normalize_local_part(
+        self,
+        part: np.ndarray,
+        scale: float,
+        *,
+        anchor_index: Optional[int],
+    ) -> np.ndarray:
+        if scale <= 0 or part.size == 0:
+            return np.zeros_like(part, dtype=np.float32)
+        result = part.copy()
+        xy = result[..., :2]
+        if anchor_index is not None and 0 <= anchor_index < xy.shape[1]:
+            anchor = xy[:, anchor_index : anchor_index + 1, :]
+            xy = xy - anchor
+        result[..., :2] = np.clip(xy / scale, -1.0, 1.0)
+        result = self._mask_low_confidence(result)
+        return result.astype(np.float32)
 
-        Returns:
-            Dict[str, np.ndarray]: Bone-normalized keypoints.
-        """
-        normalized_kpts = {}
-        bone_start, bone_end = self.normalize_bone
-        assert hasattr(self, 'keypoints'), 'Keypoints not set. Run __call__ first.'
-        fullbody_kpts = self.keypoints  # (T, 133, 3)
-        bone_vec = (
-            fullbody_kpts[:, bone_end, :2] - fullbody_kpts[:, bone_start, :2]
-        )  # (T, 2)
-        bone_length = np.linalg.norm(bone_vec, axis=-1)  # (T,)
-        bone_length[bone_length == 0] = 1.0  # 防止除零
-        bone_length[bone_length < 1e-6] = 1e-6  # 防止过小
-        confidence_indices = (
-            fullbody_kpts[:, bone_start, 2] + fullbody_kpts[:, bone_end, 2]
-        ) >= 2 * self.conf_threshold
-        avg_bone_length = (
-            np.mean(bone_length[confidence_indices])
-            if np.any(confidence_indices)
-            else 1.0
-        )
-        for part, kpts in splited_kpts.items():
-            kpts_normalized = kpts.copy()
-            kpts_normalized[..., :2] = (
-                kpts_normalized[..., :2] / avg_bone_length * unit_length
-            )
-            normalized_kpts[part] = kpts_normalized
-        return normalized_kpts
+    def _apply_global_transform(
+        self,
+        part: np.ndarray,
+        scale: float,
+        crop_origin: np.ndarray,
+    ) -> np.ndarray:
+        if scale <= 0 or part.size == 0:
+            return np.zeros_like(part, dtype=np.float32)
+        result = part.copy()
+        xy = result[..., :2]
+        xy = (xy - crop_origin[None, None, :]) / scale
+        xy = (xy - 0.5) * 2.0
+        result[..., :2] = np.clip(xy, -1.0, 1.0)
+        result = self._mask_low_confidence(result)
+        return result.astype(np.float32)
 
-    def _centralize(self, splited_kpts: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-        """Centralize keypoints by their respective center indices.
+    def _mask_low_confidence(self, coords: np.ndarray) -> np.ndarray:
+        mask = coords[..., 2] <= self.conf_threshold
+        if np.any(mask):
+            coords = coords.copy()
+            coords[mask] = 0.0
+        return coords
 
-        Args:
-            splited_kpts (Dict[str, np.ndarray]): Keypoints split by body part. Each value has shape (T, K, 3).
-
-        Returns:
-            Dict[str, np.ndarray]: Centralized keypoints.
-        """
-        centralized_kpts = {}
-        for part, kpts in splited_kpts.items():
-            center_idx = self.center_indices[part]
-            center_idx -= self.body_part_start_idx[part]  # 转为局部索引
-            center = kpts[:, center_idx : center_idx + 1, :2]  # (T, 1, 2)
-            kpts_centralized = kpts.copy()
-            kpts_centralized[..., :2] -= center  # 中心化
-            centralized_kpts[part] = kpts_centralized
-        return centralized_kpts
+    def _crop_and_scale(
+        self,
+        body: np.ndarray,
+    ) -> Tuple[np.ndarray, float, np.ndarray]:
+        result = body.copy()
+        conf = result[..., 2]
+        valid = conf > self.conf_threshold
+        if not np.any(valid):
+            zeros = np.zeros_like(result, dtype=np.float32)
+            return zeros, 0.0, np.zeros(2, dtype=np.float32)
+        xy_valid = result[..., :2][valid]
+        xmin = xy_valid[:, 0].min()
+        xmax = xy_valid[:, 0].max()
+        ymin = xy_valid[:, 1].min()
+        ymax = xy_valid[:, 1].max()
+        scale = float(max(xmax - xmin, ymax - ymin))
+        if scale <= 1e-6:
+            zeros = np.zeros_like(result, dtype=np.float32)
+            return zeros, 0.0, np.zeros(2, dtype=np.float32)
+        xs = (xmin + xmax - scale) / 2.0
+        ys = (ymin + ymax - scale) / 2.0
+        origin = np.array([xs, ys], dtype=np.float32)
+        xy = result[..., :2]
+        xy = (xy - origin[None, None, :]) / scale
+        xy = (xy - 0.5) * 2.0
+        result[..., :2] = np.clip(xy, -1.0, 1.0)
+        return result, scale, origin
 
     def _split_to_parts(self) -> Dict[str, np.ndarray]:
         assert hasattr(self, 'keypoints'), 'Keypoints not set. Run __call__ first.'

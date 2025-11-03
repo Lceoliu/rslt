@@ -1,8 +1,8 @@
 # Sign Language Translation Pipeline
 
 ## Overview
-- **Goal**: Stream chunked COCO WholeBody 2D keypoints through multi-part GCN and transformer encoder into a decoder-only LLM for sign-to-text translation.
-- **Flow**: Dataset chunking → Multi-Part GCN → Chunk Transformer → LLM Wrapper
+- **Goal**: Stream chunked COCO WholeBody 2D keypoints through multi-part GCN and lightweight temporal pooling into a decoder-only LLM for sign-to-text translation.
+- **Flow**: Dataset chunking -> Multi-Part GCN -> Temporal downsampling -> Prompted LLM
 - **Training**: Two-stage strategy with DeepSpeed ZeRO, bf16, differential learning rates, and a powerful hierarchical contrastive learning approach.
 
 ---
@@ -27,11 +27,14 @@
   1. Pad pose to length `T'` such that `(T' - window) % stride == 0`
   2. Calculate chunk count: `N = (T' - window) // stride + 1`
   3. Apply random chunk trimming (train only) based on `min_reserved_ratio`
-  4. Unfold: `[T', K, C] → [N, window, K, C]`
+  4. Unfold: `[T', K, C] -> [N, window, K, C]`
 
 ### Normalization (`transform.py`)
-- Split joints into parts: `body(17), face(68), left_hand(21), right_hand(21), fullbody(133)`
-- Normalize each part independently (reference point + scale)
+- Split joints into parts: `body(17), face(68), left_hand(21), right_hand(21)`, plus optional `fullbody`
+- Interpolate low-confidence joints, but keep their confidence at zero
+- Crop the body using a high-confidence bounding box, scale to `[-1, 1]`, and record the global scale/origin
+- Reuse the body scale for every part; hands and face are re-centered on their anchor joints before scaling
+- Zero-out joints whose confidence falls below the threshold after normalization
 - Output: `Dict[part_name, Tensor[N, window, K_part, C]]`
 
 ### Collate Function (`my_collate_fn`)
@@ -39,7 +42,7 @@
 - **Process**:
   1. Find `max_chunks = max(N_i)` across batch
   2. Pad samples to `max_chunks` by repeating last chunk
-  3. Stack parts along joint axis: `[N, window, K_part, C] → [N, window, sum_K, C]`
+  3. Stack parts along joint axis: `[N, window, K_part, C] -> [N, window, sum_K, C]`
   4. Stack batch: `[B, N, window, sum_K, C]`
 - **Output Shape**: `pose: [B, N, window=32, sum_K=133, C=2]` (conf dropped if `drop_conf=True`)
 - **Metadata**:
@@ -63,7 +66,7 @@
 - `adjacency: Dict[str, [K_part, K_part]]`
 
 ### Process
-1. **Reshape**: Merge batch and chunk axes: `[B, N, T, sum_K, C] → [B*N, T, sum_K, C]`
+1. **Reshape**: Merge batch and chunk axes: `[B, N, T, sum_K, C] -> [B*N, T, sum_K, C]`
 2. **Split by parts**: Slice along joint axis using `part_lens`:
    - `body: [B*N, T=32, K_body=17, C=2]`
    - `face: [B*N, T=32, K_face=68, C=2]`
@@ -88,99 +91,46 @@
 
 ---
 
-## 3. Chunk Transformer Encoder (`model/chunk_transformer.py`)
+## 3. Chunk Token Preparation (model/visual_encoder.py)
 
 ### Input
-- `features: [B*N, P=5, T=32, D=256]`
-- `chunk_mask: [B, N]` (derived from `pose_len`)
+- eatures: [B*N, P=5, T=32, D=256]
+- rame_mask: [B*N, T] (valid frames per chunk)
+- chunk_mask: [B, N] (valid chunks per sample)
 
 ### Process
-1. **Concatenate parts**: Flatten part dimension into feature dimension:
-   - `[B*N, P=5, T=32, D=256] → [B*N, T=32, P*D=1280]`
-2. **Input projection**: Linear layer projects to LLM dimension:
-   - `[B*N, T=32, 1280] → [B*N, T=32, E=1024]` (E = LLM hidden size)
-3. **Transformer encoder**:
-   - `layers=3`, `heads=8`, `mlp_dim=512`, `dropout=0.1`
-   - Apply self-attention with frame-level padding mask
-   - Output: `[B*N, T=32, E=1024]`
-4. **Token pooling**: Extract fixed `tokens_per_chunk=10` tokens:
-   - Learnable query tokens: `[tokens_per_chunk=10, E=1024]`
-   - Cross-attention: queries attend to encoder output
-   - Final output: `[B*N, P_tok=10, E=1024]`
+1. Flatten part dimension: [B*N, P, T, D] -> [B*N, T, P*D].
+2. Temporal stride sampling (temporal_sampling_stride in config) reduces the length to T_s = T / stride.
+3. Apply the frame mask, zeroing invalid positions, and project with a linear layer to the LLM hidden size: [B*N, T_s, E].
+4. Reshape back to [B, N, T_s, E] and derive token_mask: [B, N, T_s] by combining frame and chunk masks.
 
 ### Output
-- `chunk_tokens: [B*N, P_tok=10, E=1024]` - compressed chunk representations
+- chunk_tokens: [B, N, T_s, E]
+- token_mask: [B, N, T_s]
+- chunk_mask: [B, N]
 
----
-
-## 4. LLM Wrapper (`model/LLM_wrapper.py`)
+## 4. LLM Wrapper (model/LLM_wrapper.py)
 
 ### Input
-- `chunk_tokens: [B*N, P_tok=10, E=1024]` (reshaped to `[B, N, P_tok=10, E=1024]`)
-- `token_mask: [B, N, P_tok=10]` (bool mask for valid tokens)
-- `texts: List[str]` (length B)
+- chunk_tokens: [B, N, T_s, E]
+- token_mask: [B, N, T_s]
+- texts: List[str]
 
-### Process (Training Forward Pass)
+### Training Forward Path
+1. Flatten visual tokens per sample using token_mask to keep only valid embeddings.
+2. Prepend a fixed prompt (default: \u8bf7\u5c06\u63a5\u4e0b\u6765\u7684\u624b\u8bed\u5185\u5bb9\u7ffb\u8bd1\u6210\u6587\u5b57\uff1a) by looking up its token embeddings.
+3. Tokenize the ground-truth text (max_text_len) and embed it; append the model's EOS token.
+4. Concatenate [prompt_embeds, visual_embeds, text_embeds, eos_embed].
+5. Build labels: prefix positions (prompt + visual) are set to -100, text positions keep their token IDs, EOS label equals eos_id.
+6. Pad batched sequences to build inputs_embeds, attention_mask, and labels, then call the causal LM.
 
-#### 4.1 Build Visual Prefix (per sample)
-For each sample `i` with `n_i` valid chunks (from `pose_len[i]`):
-1. **Extract valid chunks**: `chunk_tokens[i, :n_i, :, :]` → `[n_i, P_tok=10, E]`
-2. **Build chunk sequences**: For each chunk `j`:
-   ```
-   <BOC>[10 tokens]<EOC>
-   ```
-   - `<BOC>`: Beginning-of-chunk token (trainable embedding, shape `[1, E]`)
-   - `[10 tokens]`: Chunk embeddings from transformer `[P_tok=10, E]`
-   - `<EOC>`: End-of-chunk token (trainable embedding, shape `[1, E]`)
-3. **Concatenate all chunks**:
-   ```
-   prefix = [<BOC>, tok_1_1, ..., tok_1_10, <EOC>, <BOC>, tok_2_1, ..., tok_2_10, <EOC>, ..., <BOC>, tok_n_1, ..., tok_n_10, <EOC>]
-   ```
-   - Length: `n_i * (P_tok + 2) = n_i * 12`
-   - Shape: `[n_i * 12, E]`
-   - Prefix labels: All set to `-100` (ignored in loss)
+### Inference
+- Reuse the same prompt+visual prefix and call generate.
+- Drop the prefix length from generated token IDs before decoding to text.
 
-#### 4.2 Build Text Suffix
-1. **Tokenize text**: `text_ids = tokenizer(texts[i])` → `[L_text]` (max `max_text_len=128`)
-2. **Add special tokens**:
-   ```
-   <BOT> text_tokens <EOT>
-   ```
-   - `<BOT>`: Beginning-of-text token
-   - `<EOT>`: End-of-text token
-   - Shape: `[L_text + 2, E]` after embedding
-3. **Text labels**: `[text_ids, EOT_id]` (first token label is `-100`)
-
-#### 4.3 Build Full Sequence
-```
-seq = [prefix, <BOT>, text_tokens, <EOT>]
-```
-- Total length: `n_i * 12 + L_text + 2`
-- Shape: `[seq_len, E=1024]`
-- Labels: `[-100 * (n_i * 12), -100, text_ids, EOT_id]`
-
-#### 4.4 Batch Padding
-- Pad sequences to `max_seq_len = max(seq_len_i)` across batch
-- `inputs_embeds: [B, max_seq_len, E]`
-- `labels: [B, max_seq_len]` (padded with `-100`)
-- `attention_mask: [B, max_seq_len]` (causal mask + padding mask)
-
-#### 4.5 LLM Forward
-```python
-outputs = model(
-    inputs_embeds=inputs_embeds[:, :-1, :],  # shift right
-    attention_mask=attention_mask[:, :-1],
-    labels=labels[:, 1:],  # shift left for next-token prediction
-)
-loss = outputs.loss  # Cross-entropy averaged over non-padding tokens
-```
-
-### Output
-- `outputs.loss` - Autoregressive cross-entropy loss (includes special tokens)
-- `outputs.logits: [B, max_seq_len-1, vocab_size]` - Next-token predictions
-- `labels: [B, max_seq_len]` - Target token IDs
-
----
+### Masking Notes
+- token_mask ensures repeated/padded visual tokens never contribute to loss.
+- The prompt keeps instructions explicit without trainable special token embeddings.
 
 ## 5. Training Pipeline (`training/train_deepspeed.py`)
 

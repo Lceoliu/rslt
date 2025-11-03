@@ -62,10 +62,7 @@ llm:
   max_text_len: 128
   freeze_lm: false # 核心：此阶段训练整个模型
   gradient_checkpointing: false
-  boc_token: <BOC>
-  eoc_token: <EOC>
-  bot_token: <BOT>
-  eot_token: <EOT>
+  prompt_text: "\u8bf7\u5c06\u63a5\u4e0b\u6765\u7684\u624b\u8bed\u5185\u5bb9\u7ffb\u8bd1\u6210\u6587\u5b57\uff1a"
   contrastive_tau: 0.08
   contrastive_neg_k: 256
   contrastive_projection_dim: 256 # Dimension of the contrastive projection head

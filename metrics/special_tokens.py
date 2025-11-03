@@ -20,6 +20,10 @@ def analyze_special_tokens(model: torch.nn.Module) -> Dict[str, any]:
     Returns:
         Dictionary with similarity matrix and statistics
     """
+    if not hasattr(model.llm, "_special_ids"):
+        return {
+            'error': 'Model does not expose special tokens; prompt-based prefix is used instead.',
+        }
     # Get embedding layer
     embedding_layer = model.llm.model.get_input_embeddings()
 

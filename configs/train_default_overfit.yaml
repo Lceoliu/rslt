@@ -50,10 +50,7 @@ llm:
   max_text_len: 128
   freeze_lm: false
   gradient_checkpointing: false
-  boc_token: "<BOC>"
-  eoc_token: "<EOC>"
-  bot_token: "<BOT>"
-  eot_token: "<EOT>"
+  prompt_text: "\u8bf7\u5c06\u63a5\u4e0b\u6765\u7684\u624b\u8bed\u5185\u5bb9\u7ffb\u8bd1\u6210\u6587\u5b57\uff1a"
 
 decoding:
   max_new_tokens: 64
