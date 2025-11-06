@@ -81,6 +81,8 @@ class MultiPartGCNModel(nn.Module):
         temporal_kernel: Temporal kernel size for Uni-GCN blocks.
         adaptive: Whether Uni-GCN uses adaptive adjacency.
         dropout: Dropout applied after Uni-GCN projection.
+        enable_body_fusion: Whether to fuse body features into other parts (UniSign-style).
+        share_hand_params: Whether left_hand and right_hand share parameters.
     """
 
     def __init__(
@@ -93,6 +95,8 @@ class MultiPartGCNModel(nn.Module):
         temporal_kernel: int = 5,
         adaptive: bool = True,
         dropout: float = 0.0,
+        enable_body_fusion: bool = True,
+        share_hand_params: bool = True,
     ) -> None:
         super().__init__()
         self.parts: Tuple[str, ...] = tuple(parts) if parts else _DEFAULT_PARTS
@@ -102,9 +106,19 @@ class MultiPartGCNModel(nn.Module):
         self.temporal_kernel = temporal_kernel
         self.adaptive = adaptive
         self.dropout = dropout
+        self.enable_body_fusion = enable_body_fusion
+        self.share_hand_params = share_hand_params
 
         self._in_channels: Optional[int] = None
         self.backbones = nn.ModuleDict()
+
+        # Body keypoint indices for fusion (COCO-17 format)
+        # 0: nose, 9: left_wrist, 10: right_wrist
+        self.body_keypoint_map = {
+            'left_hand': 9,   # left wrist
+            'right_hand': 10,  # right wrist
+            'face': 0,         # nose/neck
+        }
 
     @property
     def is_initialized(self) -> bool:
@@ -127,12 +141,22 @@ class MultiPartGCNModel(nn.Module):
             )
         if self.backbones:
             return
+
+        # Track which parts have been created (for parameter sharing)
+        created_parts = set()
+
         for part in self.parts:
+            # Skip left_hand if sharing with right_hand (create right_hand first)
+            if self.share_hand_params and part == 'left_hand' and 'right_hand' in self.parts:
+                if 'right_hand' not in created_parts:
+                    continue  # Will be handled when we process right_hand
+
             adj = adjacency[part]
             if not isinstance(adj, torch.Tensor):
                 adj = torch.as_tensor(adj, dtype=torch.float32, device=device)
             else:
                 adj = adj.detach().to(device=device, dtype=torch.float32)
+
             backbone = UniGCNPartBackbone(
                 in_channels=in_channels,
                 adjacency=adj,
@@ -143,6 +167,14 @@ class MultiPartGCNModel(nn.Module):
                 dropout=self.dropout,
             ).to(device)
             self.backbones[part] = backbone
+            created_parts.add(part)
+
+            # If this is right_hand and we share params, also assign to left_hand
+            if self.share_hand_params and part == 'right_hand' and 'left_hand' in self.parts:
+                print(f"[MultiPartGCN] Sharing parameters: left_hand <-> right_hand")
+                self.backbones['left_hand'] = self.backbones['right_hand']
+                created_parts.add('left_hand')
+
         self._in_channels = in_channels
 
     def initialize_backbones(
@@ -240,19 +272,55 @@ class MultiPartGCNModel(nn.Module):
         )
         part_poses = _slice_pose_by_part(flat_pose, part_lens)
 
-        outputs = []
+        # === Phase 1: Spatial GCN for all parts (UniSign-style) ===
+        spatial_features = {}
         mask_for_backbone = frame_mask_float
+
         for part_name, part_pose in zip(self.parts, part_poses):
             if self.drop_conf and channels >= 2:
                 part_pose = part_pose[..., :channels_used]
             x = part_pose.permute(0, 3, 1, 2).contiguous()  # [B*N, C, T, K]
-            feats = self.backbones[part_name](
-                x,
+
+            # Execute only spatial GCN
+            spatial_feat = self.backbones[part_name].forward_spatial(
+                x, mask=mask_for_backbone
+            )  # [B*N, C_spatial, T, V]
+            spatial_features[part_name] = spatial_feat
+
+        # === Phase 2: Body-to-Part Fusion (UniSign-style) ===
+        if self.enable_body_fusion and 'body' in self.parts:
+            body_spatial_feat = spatial_features['body']  # [B*N, C_spatial, T, V_body]
+
+            for part_name in self.parts:
+                if part_name == 'body' or part_name == 'fullbody':
+                    continue
+
+                # Get the corresponding body keypoint index for this part
+                body_kp_idx = self.body_keypoint_map.get(part_name)
+                if body_kp_idx is not None:
+                    # Extract the specific body keypoint feature
+                    # body_spatial_feat: [B*N, C_spatial, T, V_body]
+                    # Extract keypoint at index body_kp_idx: [B*N, C_spatial, T, 1]
+                    body_node_feat = body_spatial_feat[:, :, :, body_kp_idx:body_kp_idx+1]
+
+                    # Add to the part's spatial features (broadcast across all keypoints)
+                    # This follows UniSign's approach: gcn_feat + body_feat[..., idx][..., None].detach()
+                    spatial_features[part_name] = spatial_features[part_name] + body_node_feat.detach()
+
+        # === Phase 3: Temporal GCN and pooling for all parts ===
+        outputs = []
+        for part_name in self.parts:
+            spatial_feat = spatial_features[part_name]
+
+            # Execute temporal GCN and pooling
+            feats = self.backbones[part_name].forward_temporal(
+                spatial_feat,
                 mask=mask_for_backbone,
                 return_seq=True,
             )  # [B*N, T, D]
-            if feats.dtype != part_pose.dtype:
-                feats = feats.to(part_pose.dtype)
+
+            if feats.dtype != pose.dtype:
+                feats = feats.to(pose.dtype)
             outputs.append(feats)
 
         features = torch.stack(outputs, dim=1)  # [B*N, P, T, D]

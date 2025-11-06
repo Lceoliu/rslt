@@ -30,6 +30,10 @@ def build_visual_encoder(cfg: Dict[str, Any], llm_dim: int) -> VisualEncoder:
     sampling_stride = int(mcfg.get("temporal_sampling_stride", 2))
     tokens_per_chunk = int(mcfg.get("tokens_per_chunk", 0))
 
+    # UniSign-style fusion flags (enabled by default)
+    enable_body_fusion = bool(mcfg.get("enable_body_fusion", True))
+    share_hand_params = bool(mcfg.get("share_hand_params", True))
+
     encoder = VisualEncoder(
         parts=parts,
         drop_conf=bool(mcfg.get("drop_conf", True)),
@@ -41,6 +45,8 @@ def build_visual_encoder(cfg: Dict[str, Any], llm_dim: int) -> VisualEncoder:
         tokens_per_chunk=tokens_per_chunk,
         llm_dim=int(llm_dim),
         sampling_stride=sampling_stride,
+        enable_body_fusion=enable_body_fusion,
+        share_hand_params=share_hand_params,
     )
     return encoder
 

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(dir \"D:\\SKD\\SLR\\rslt\" /B)"
+    ],
+    "additionalDirectories": [
+      "D:\\SKD\\SLR\\Uni-Sign\\"
+    ]
+  }
+}

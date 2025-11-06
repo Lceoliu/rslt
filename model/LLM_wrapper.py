@@ -20,6 +20,7 @@ class LLMWithVisualPrefix(nn.Module):
         verbose: bool = False,
         compute_special_token_loss: bool = False,
         prompt_text: str = "\u8bf7\u5c06\u63a5\u4e0b\u6765\u7684\u624b\u8bed\u5185\u5bb9\u7ffb\u8bd1\u6210\u6587\u5b57\uff1a",
+        label_smoothing: float = 0.0,
     ) -> None:
         super().__init__()
         try:
@@ -66,6 +67,15 @@ class LLMWithVisualPrefix(nn.Module):
 
         self.max_text_len = int(max_text_len)
         self.compute_special_token_loss = compute_special_token_loss  # kept for config compatibility
+
+        # UniSign-style label smoothing (Bug #8 fix)
+        self.label_smoothing = float(label_smoothing)
+        self.loss_fct = nn.CrossEntropyLoss(
+            ignore_index=-100,
+            label_smoothing=self.label_smoothing,
+        )
+        if self.verbose and self.label_smoothing > 0:
+            print(f"Using label smoothing: {self.label_smoothing}")
 
     @property
     def device(self) -> torch.device:
@@ -132,11 +142,30 @@ class LLMWithVisualPrefix(nn.Module):
             seq_labels.append(labels)
 
         inputs_embeds, attention_mask, labels = self._pad_sequences(seq_embeds, seq_labels)
+
+        # Forward pass without labels (to get logits)
         outputs = self.model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            labels=labels,
         )
+
+        # Manually compute loss with label smoothing (Bug #8 fix)
+        logits = outputs.logits  # [B, seq_len, vocab_size]
+
+        # Shift logits and labels for next-token prediction
+        # logits: [B, seq_len-1, vocab_size], labels: [B, seq_len-1]
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        # Flatten for CrossEntropyLoss
+        loss = self.loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1)
+        )
+
+        # Add loss to outputs (for compatibility)
+        outputs.loss = loss
+
         return outputs, labels
 
     @torch.no_grad()
@@ -188,12 +217,20 @@ class LLMWithVisualPrefix(nn.Module):
         )
 
         results: List[str] = []
+        pad_id = self.tokenizer.pad_token_id
         for seq, prefix_len in zip(sequences, lengths.tolist()):
-            gen_tokens = seq[prefix_len:]
-            if eos_id is not None and (gen_tokens == eos_id).any():
-                stop = torch.nonzero(gen_tokens == eos_id, as_tuple=False)[0].item()
-                gen_tokens = gen_tokens[:stop]
-            text = self.tokenizer.decode(gen_tokens.tolist(), skip_special_tokens=True)
+            seq_tokens = seq.tolist()
+            content = seq_tokens[prefix_len:] if prefix_len < len(seq_tokens) else []
+            if pad_id is not None:
+                content = [tok for tok in content if tok != pad_id]
+            if not content:
+                fallback = seq_tokens[prefix_len:] if prefix_len < len(seq_tokens) else seq_tokens
+                if pad_id is not None:
+                    fallback = [tok for tok in fallback if tok != pad_id]
+                content = fallback
+            if eos_id is not None and eos_id in content:
+                content = content[: content.index(eos_id)]
+            text = self.tokenizer.decode(content, skip_special_tokens=True).strip()
             results.append(text)
         return results
 

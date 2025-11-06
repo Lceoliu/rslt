@@ -36,6 +36,8 @@ class VisualEncoder(nn.Module):
         tokens_per_chunk: int = 4,
         llm_dim: int = 1024,
         sampling_stride: int = 2,
+        enable_body_fusion: bool = True,
+        share_hand_params: bool = True,
     ) -> None:
         super().__init__()
         self.multipart = MultiPartGCNModel(
@@ -46,6 +48,8 @@ class VisualEncoder(nn.Module):
             temporal_kernel=gcn_temporal_kernel,
             adaptive=gcn_adaptive,
             dropout=gcn_dropout,
+            enable_body_fusion=enable_body_fusion,
+            share_hand_params=share_hand_params,
         )
         part_count = len(self.multipart.parts)
         if sampling_stride <= 0:

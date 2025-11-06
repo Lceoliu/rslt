@@ -57,18 +57,19 @@ class UniGCNPartBackbone(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.embed_dim = embed_dim
 
-    def forward(
+    def forward_spatial(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        return_seq: bool = False,
     ) -> torch.Tensor:
-        """Encode poses of shape [B, C, T, V].
+        """Execute only spatial GCN, return features before temporal processing.
 
         Args:
-            x: Input pose tensor.
+            x: Input pose tensor [B, C, T, V].
             mask: Optional binary mask [B, T] marking valid frames.
-            return_seq: Whether to return per-frame features [B, T, D].
+
+        Returns:
+            Spatial features [B, C_spatial, T, V] after spatial GCN.
         """
         if x.dim() != 4:
             raise ValueError(f"Expected input of shape [B,C,T,V], got {x.shape}")
@@ -88,11 +89,35 @@ class UniGCNPartBackbone(nn.Module):
         x = self.proj(x)  # [B, T, V, proj_dim]
         x = x.permute(0, 3, 1, 2).contiguous()  # [B, proj_dim, T, V]
 
-        x = self.spatial_chain(x)
-        x = self.temporal_chain(x)
-        x = x.mean(dim=-1)  # [B, hidden, T]
-        x = x.transpose(1, 2).contiguous()  # [B, T, hidden]
-        x = self.out_proj(x)
+        x = self.spatial_chain(x)  # [B, C_spatial, T, V]
+        return x
+
+    def forward_temporal(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        return_seq: bool = False,
+    ) -> torch.Tensor:
+        """Execute temporal GCN and pooling from spatial features.
+
+        Args:
+            x: Spatial features [B, C_spatial, T, V].
+            mask: Optional binary mask [B, T] marking valid frames.
+            return_seq: Whether to return per-frame features [B, T, D].
+
+        Returns:
+            Final features [B, T, D] if return_seq=True, else [B, D].
+        """
+        B, _, T, _ = x.shape
+        dtype = x.dtype
+
+        if mask is not None:
+            mask = mask.to(dtype)
+
+        x = self.temporal_chain(x)  # [B, C_temporal, T, V]
+        x = x.mean(dim=-1)  # [B, C_temporal, T]
+        x = x.transpose(1, 2).contiguous()  # [B, T, C_temporal]
+        x = self.out_proj(x)  # [B, T, embed_dim]
         x = self.dropout(x)
 
         if mask is not None:
@@ -108,6 +133,36 @@ class UniGCNPartBackbone(nn.Module):
         denom = weights.sum(dim=1).clamp_min(1.0)
         pooled = (x * weights).sum(dim=1) / denom
         return pooled
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        return_seq: bool = False,
+        body_fusion_feat: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Encode poses of shape [B, C, T, V].
+
+        Args:
+            x: Input pose tensor.
+            mask: Optional binary mask [B, T] marking valid frames.
+            return_seq: Whether to return per-frame features [B, T, D].
+            body_fusion_feat: Optional body features to fuse [B, C_spatial, T, 1].
+                If provided, will be added after spatial GCN before temporal GCN.
+
+        Returns:
+            Encoded features [B, T, D] if return_seq=True, else [B, D].
+        """
+        # Execute spatial processing
+        x = self.forward_spatial(x, mask)  # [B, C_spatial, T, V]
+
+        # Fuse body features if provided (UniSign-style fusion)
+        if body_fusion_feat is not None:
+            x = x + body_fusion_feat.detach()  # Detach to prevent gradient flow
+
+        # Execute temporal processing and pooling
+        x = self.forward_temporal(x, mask, return_seq)
+        return x
 
 
 

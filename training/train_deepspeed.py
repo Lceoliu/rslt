@@ -71,6 +71,8 @@ class VLLMTrainer(nn.Module):
         self.compute_special_token_loss = bool(
             llm_cfg.get('compute_special_token_loss', False)
         )
+        # UniSign-style label smoothing (Bug #8 fix)
+        label_smoothing = float(llm_cfg.get('label_smoothing', 0.2))
         self.llm = LLMWithVisualPrefix(
             model_name_or_path=model_name,
             trust_remote_code=trust_remote_code,
@@ -82,6 +84,7 @@ class VLLMTrainer(nn.Module):
                 'prompt_text',
                 "请将接下来的手语内容翻译成文字：",
             ),
+            label_smoothing=label_smoothing,
         )
         self.visual = build_visual_encoder(cfg, llm_dim=self.llm.hidden_size)
         print(f"LLM hidden size: {self.llm.hidden_size}")
